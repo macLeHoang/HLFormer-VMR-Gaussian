@@ -53,7 +53,7 @@ cfg["hidden_size"]    = 384   # v30: restored to 384; v28=320 hit capacity ceili
 cfg["n_heads"]        = 6     # 384/8=48 per head
 cfg["num_queries"]    = 10    # v37: increase proposal capacity for better candidate coverage
 cfg["dec_layers"]     = 4
-cfg["input_drop"]     = 0.25
+cfg["input_drop"]     = 0.15
 cfg["drop"]           = 0.15
 cfg["txt_drop_ratio"] = 0.1
 cfg["t2v_layers"]     = 4
@@ -72,7 +72,7 @@ cfg["use_refined_spans"] = True
 # ---- v37 alignment flags ---------------------------------------------------
 # Match and quality-target supervision should follow the same span space used
 # at evaluation time (refined when available), with safe fallback to coarse.
-cfg["match_span_source"]   = "refined"   # coarse | refined | dual
+cfg["match_span_source"]   = "dual"      # coarse | refined | dual
 cfg["refined_cost_weight"] = 0.5         # used only when match_span_source="dual"
 cfg["label_span_source"]   = "matched"   # coarse | refined | matched
 
@@ -90,7 +90,7 @@ cfg["contrastive_align_loss_coef"] = 0.15  # v33: 0.05→0.15; cross-modal align
 cfg["temperature"]                 = 0.07  # sharpened from 0.15; faster NCE convergence with real cross-sample negatives (B=32)
 
 # ---- Saliency ------------------------------------------------------------
-cfg["lw_saliency"]     = 0.05  # v34: 0.2→0.05; saliency doesn't contribute to R1, redirect budget to span losses.
+cfg["lw_saliency"]     = 0.1  # v34: 0.2→0.05; saliency doesn't contribute to R1, redirect budget to span losses.
 cfg["saliency_margin"] = 1.0
 
 # ---- Loss weights --------------------------------------------------------
@@ -110,10 +110,10 @@ cfg["label_loss_coef"]    = 2.0   # v33: 4.0→2.0; quality head converges fast,
 # direct boundary supervision from the beginning.
 cfg["boundary_refine_coef"]           = 1.0   # phase-0 default; schedule ramps refinement gradually.
 cfg["boundary_refine_giou_coef"]      = 1.0
-cfg["boundary_refine_window"]         = 16     # v34: at max_v_l=77, sigma=16/154≈0.10 (10% of video); tight enough for precise boundary pooling
+cfg["boundary_refine_window"]         = 12     # v34: at max_v_l=77, sigma=16/154≈0.10 (10% of video); tight enough for precise boundary pooling
 cfg["boundary_refine_learnable_sigma"] = True
-cfg["boundary_refine_max_delta"]      = 0.15  # reduced from 0.2: less over-correction on borderline R1@0.7 predictions
-cfg["alpha_iou_alpha"]                = 2.0   # v34: 2.5→3.0; stronger gradient amplification in 0.5-0.7 IoU zone
+cfg["boundary_refine_max_delta"]      = 0.08  # tightened from 0.15; late training needs 1-4 frame micro-corrections
+cfg["alpha_iou_alpha"]                = 2.5   # v34: 2.5→3.0; stronger gradient amplification in 0.5-0.7 IoU zone
 
 # aux_loss_scale starts low: early decoder layers produce near-zero IoU targets,
 # creating a strong "everything is background" pull if aux losses are weighted heavily.
@@ -137,7 +137,7 @@ cfg["lr_vid_enc"]    = 0.5e-4   # v34: 5e-5→1e-4; proportional to lr increase
 cfg["lr_drop"]       = 30     # kept for backward compat; unused when cosine_T0 > 0
 cfg["lr_gamma"]      = 0.5    # kept for backward compat
 cfg["warmup_epochs"] = 5
-cfg["cosine_T0"]     = 40
+cfg["cosine_T0"]     = 30
 cfg["cosine_Tmult"]  = 2      # v32: NEW; second cycle = 60 epochs (total ~90 before 2nd restart)
 cfg["cosine_eta_min_ratio"] = 0.01  # v32: NEW; min LR = 1% of base at cycle trough
 cfg["wd"]            = 5e-5   # v32: 5e-6→1e-4; 20x increase to regularize weights (5e-6 is effectively zero)
@@ -165,7 +165,7 @@ cfg["aug_schedule"] = [
     (0, {
         "temporal_crop_ratio": 0.2,
         "feat_mask_ratio":     0.15,
-        "gt_jitter_frames":    2,
+        "gt_jitter_frames":    1,
     }),
     (45, {
         "temporal_crop_ratio": 0.05,
@@ -185,14 +185,13 @@ cfg["val_full_epoch"] = 30   # validate every epoch from epoch 30 onward (covers
 # apply_loss_schedule() in main_vmr.py reads this and patches criterion.weight_dict
 # and matcher costs at phase boundaries.
 #
-# v34 schedule: boundary refinement starts at 4.0 from ep0 (zero-init guarantees safety),
-#
-# Phase 1  (ep  0-14): Coarse localization — boundary refine at 1.0 (head warms up),
-#                       zero-init head activates gradually.
-# Phase 2  (ep 15-19): Boundary refine jumps to 4.0 — refine head actively correcting.
-# Phase 3  (ep 20-39): Boundary refine at 5.0 — refine head learns width+text conditioning.
-# Phase 4  (ep 40-59): IoU dominant — span L1 reduces, giou+boundary amplified.  Cap at 6.0.
-# Phase 5  (ep 60+  ): Cap at 6.0 — refinement must not dominate over decoder supervision.
+# Phase 1  (ep  0-14): Coarse localization — boundary refine at 1.0 (head warms up via zero-init).
+# Phase 2  (ep 15-29): Boundary refine gently raised to 2.0 — refine head actively correcting.
+# Phase 3  (ep 30-44): Boundary refine capped at 2.5 — coarse decoder stays dominant.
+#                       Capped to avoid the R1@0.7 regression observed when boundary_refine_coef
+#                       exceeded 3.0 while match_span_source='refined' (gradient starvation on
+#                       coarse decoder). With 'dual' matching this is relaxed but kept conservative.
+# Phase 4  (ep 45+  ): IoU-budget rebalance: giou↑, span↓, contrastive↓.
 #
 # Static cfg values above must match Phase 1 so build_criterion() starts correctly.
 cfg["loss_schedule"] = [
@@ -208,51 +207,20 @@ cfg["loss_schedule"] = [
         "set_cost_giou":               2.0,
     }),
     (15, {
-        "boundary_refine_coef":        3.0,
-        "boundary_refine_giou_coef":   3.0,
-    }),
-    (20, {
-        "boundary_refine_coef":        3.5,   # held lower during cosine LR restart at ep25
-        "boundary_refine_giou_coef":   3.5,
+        "boundary_refine_coef":        2.0,
+        "boundary_refine_giou_coef":   2.0,
     }),
     (30, {
-        "boundary_refine_coef":        4.5,   # advance after LR restart stabilizes
-        "boundary_refine_giou_coef":   4.5,
-        "set_cost_class":              2.2,   # matching cost ramp moved earlier (class_error stable by ep21)
+        "boundary_refine_coef":        2.5,
+        "boundary_refine_giou_coef":   2.5,
+        "set_cost_class":              2.2,
         "set_cost_giou":               2.2,
     }),
-    (40, {
-        "span_loss_coef":              9.5,
-        "giou_loss_coef":              6.2,
-        "boundary_refine_coef":        5.0,
-        "boundary_refine_giou_coef":   5.0,
-    }),
-    (50, {
+    (45, {
         "span_loss_coef":              9.0,
-        "giou_loss_coef":              6.5,
-        "boundary_refine_coef":        5.4,
-        "boundary_refine_giou_coef":   5.4,
-        "contrastive_align_loss_coef": 0.1,
-        "set_cost_class":              2.5,
-        "set_cost_giou":               2.5,
-    }),
-    (55, {
-        "boundary_refine_coef":        6.0,
-        "boundary_refine_giou_coef":   6.0,
+        "giou_loss_coef":              7.0,
         "contrastive_align_loss_coef": 0.05,
-        "set_cost_class":              3.0,
-        "set_cost_giou":               3.0,
-    }),
-    (60, {
         "aux_loss_scale":              0.1,
-    }),
-    (65, {
-        "span_loss_coef":              6.0,
-        "giou_loss_coef":              8.0,
-        "boundary_refine_coef":        6.0,
-        "boundary_refine_giou_coef":   6.0,
-        "set_cost_class":              3.5,
-        "aux_loss_scale":              0.05,
     }),
 ]
 

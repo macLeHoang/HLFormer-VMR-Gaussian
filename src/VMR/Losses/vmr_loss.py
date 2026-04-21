@@ -393,7 +393,9 @@ class VMRSetCriterion(nn.Module):
         src_xx = span_cxw_to_xx(src_cxw)
         tgt_xx = span_cxw_to_xx(tgt_cxw)
 
-        loss_bdy = F.smooth_l1_loss(src_xx, tgt_xx, reduction="mean", beta=0.05)
+        # beta=0.02 ≈ 1.5 frames at max_v_l=75: keeps quadratic gradient in the 1–3 frame
+        # zone that separates R1@0.5 hits from R1@0.7 hits (was 0.05 ≈ 3.75 frames).
+        loss_bdy = F.smooth_l1_loss(src_xx, tgt_xx, reduction="mean", beta=0.02)
         loss_iou = alpha_iou_temporal_loss(src_xx, tgt_xx, alpha=self.alpha_iou_alpha)
 
         return {"loss_boundary_refined": loss_bdy, "loss_giou_refined": loss_iou}

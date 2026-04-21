@@ -326,7 +326,7 @@ class VMRDecoder(nn.Module):
 
             if i < len(self.layers) - 1:
                 aux_list.append(tgt)                 # save unnormed for aux loss
-                reference_points = new_refs          # no detach: gradient flows through refinement chain
+                reference_points = new_refs.detach()  # decouple per-layer bbox_embed gradients
             else:
                 reference_points = new_refs
 
@@ -372,6 +372,9 @@ class MultiStreamVidProjection(nn.Module):
 
         n = len(stream_dims)
         if n > 1:
+            # Learned per-stream importance logits; zeros → uniform (= current behaviour) at init.
+            # softmax(stream_logits) is inspectable after training to see which stream dominates.
+            self.stream_logits = nn.Parameter(torch.zeros(n))
             self.fusion = nn.Sequential(
                 nn.Linear(n * H, H, bias=False),
                 nn.LayerNorm(H),
@@ -384,6 +387,8 @@ class MultiStreamVidProjection(nn.Module):
         streams = x.split(self.stream_dims, dim=-1)           # tuple of (B, L, dim_i)
         projected = [proj(s) for proj, s in zip(self.stream_projs, streams)]
         if len(projected) > 1:
+            alpha = F.softmax(self.stream_logits, dim=0)      # (n,) — learned stream weights
+            projected = [a * p for a, p in zip(alpha, projected)]
             return self.fusion(torch.cat(projected, dim=-1))  # (B, L, H)
         return projected[0]                                   # (B, L, H)
 
@@ -466,7 +471,12 @@ class BoundaryRefinementHead(nn.Module):
         min_sig = 1.0 / (4.0 * L)                               # floor: 0.25 frames
 
         if txt_rep is not None:
-            txt_off = self.sigma_txt_proj(txt_rep)               # (B, 2)
+            # Bound text offset to ±0.5 * log_range so sigma_txt_proj can't explode.
+            # log_range = log(max_sigma / min_sigma); text can shift sigma by at most
+            # half that range in log-space. The post-hoc clamp is kept as a safety net
+            # but no longer hides unbounded txt_off gradients.
+            _log_range = math.log(max(float(L) * min_sig * 4.0, 1.0 + 1e-6))  # ≈ log(1) = 0 at min, grows with L
+            txt_off = torch.tanh(self.sigma_txt_proj(txt_rep)) * (0.5 * _log_range)  # (B, 2)
             txt_off_s = txt_off[:, 0:1]                          # (B, 1)
             txt_off_e = txt_off[:, 1:2]                          # (B, 1)
         else:
@@ -648,14 +658,22 @@ class HLFormer_VMR(nn.Module):
             embed_dim=H, num_heads=config.n_heads,
             dropout=config.drop, batch_first=True)
         self.caq_norm     = nn.LayerNorm(H)
-        # 2-layer MLP: H → H → 2 (reference-point offset in inv-sigmoid space)
+        # 2-layer MLP: H → H → 2 (reference-point offset in inv-sigmoid space).
+        # Receives caq_out (video-attended content) — kept for backward compat.
         self.caq_ref_head = nn.Sequential(
             nn.Linear(H, H), nn.ReLU(),
             nn.Linear(H, 2))
+        # Separate text-only reference initializer: txt_mean → (Δcx, Δw).
+        # Decouples *what* the query attends to (video content via caq_attn)
+        # from *where* it points initially (text prior via caq_ref_init).
+        # Zero-init final layer: identity start, offset grows as training progresses.
+        self.caq_ref_init = MLP(H, H, 2, 2)
 
         # ---- Prediction heads ------------------------------------------
-        self.class_head = nn.Linear(H, 1)   # single quality logit; [..0] indexing removed
-        # span head removed: spans come from bbox_embed inside VMRDecoder
+        self.class_head  = nn.Linear(H, 1)   # single quality logit; [..0] indexing removed
+        # Gate that learns per-query when to trust boundary refinement vs coarse spans.
+        # Bias=-1.0 so initial gate≈0.27 — refinement contributes but doesn't dominate at ep0.
+        self.refine_gate = nn.Linear(H, 1)
 
         # ---- Saliency projections --------------------------------------
         self.saliency_proj1 = nn.Linear(H, H)
@@ -712,16 +730,22 @@ class HLFormer_VMR(nn.Module):
         if self.boundary_refine.learnable_sigma:
             nn.init.zeros_(self.boundary_refine.sigma_width_scale_start)
             nn.init.zeros_(self.boundary_refine.sigma_width_scale_end)
-        # Zero-init text portion of joint_mlp first layer (columns 2H:3H) so text
-        # input starts contributing nothing and activates gradually.
+        # Small-normal init for text portion of joint_mlp first layer (columns 2H:3H).
+        # Was zero-init: text input was stuck behind a zero floor and required large
+        # gradients to activate. std=0.01 lets text inform refinement from step 1
+        # while staying small enough that it doesn't corrupt the ep0 boundary estimate.
         with torch.no_grad():
             _H = self.boundary_refine._H
-            self.boundary_refine.joint_mlp.layers[0].weight[:, 2 * _H:].zero_()
+            nn.init.normal_(self.boundary_refine.joint_mlp.layers[0].weight[:, 2 * _H:],
+                            mean=0.0, std=0.01)
         # Zero-init caq_ref_head final layer so initial reference-point offsets=0.
         # This means at ep0 CAQ produces the same reference points as the static
         # uniform linspace init, and the offset grows as training progresses.
         nn.init.zeros_(self.caq_ref_head[-1].weight)
         nn.init.zeros_(self.caq_ref_head[-1].bias)
+        # Zero-init caq_ref_init final layer (text-only ref offset MLP) for same reason.
+        nn.init.zeros_(self.caq_ref_init.layers[-1].weight)
+        nn.init.zeros_(self.caq_ref_init.layers[-1].bias)
         # Zero-init caq_attn output projection so caq_out=0 at ep0.
         # Without this, MHA produces random-magnitude output that corrupts tgt
         # at initialisation (observed: class_error=87% vs v28's 45%).
@@ -729,6 +753,9 @@ class HLFormer_VMR(nn.Module):
         # activates as training progresses.
         nn.init.zeros_(self.caq_attn.out_proj.weight)
         nn.init.zeros_(self.caq_attn.out_proj.bias)
+        # Init refine_gate bias to -1.0 so sigmoid(0 * x + (-1)) ≈ 0.27 at ep0.
+        # Refinement contributes but doesn't dominate; gate grows as training progresses.
+        nn.init.constant_(self.refine_gate.bias, -1.0)
         # Spread decoder query reference points uniformly: cx in [0.1, 0.9], w = 0.3
         # sigmoid(query_embed.weight) is used as the initial reference point in _decode,
         # so we store inv_sigmoid of the desired initial values.
@@ -843,11 +870,12 @@ class HLFormer_VMR(nn.Module):
             # 3. Add attended features to base content embedding.
             tgt = tgt + caq_out
 
-            # 4. Content-adaptive reference points: shift the uniform linspace
-            #    initialisation by a learned offset derived from the attended
-            #    features.  Zero-init of caq_ref_head final layer means the
-            #    offset starts at 0 (identity) and grows as training progresses.
-            ref_offset = self.caq_ref_head(caq_out)             # (B, Q, 2)
+            # 4. Content-adaptive reference points: use text mean (not video-attended
+            #    content) to set the initial position prior.  This decouples WHAT
+            #    the query attends to (video content via caq_attn) from WHERE it
+            #    points initially (text prior via caq_ref_init).
+            #    Zero-init of caq_ref_init.layers[-1] means offset=0 at ep0.
+            ref_offset = self.caq_ref_init(txt_mean).unsqueeze(1).expand(B, Q, 2)  # (B, Q, 2)
             base_ref   = self.query_embed.weight.sigmoid() \
                              .unsqueeze(0).expand(B, -1, -1)    # (B, Q, 2)
             # Add offset in inv-sigmoid space then re-sigmoid to stay in [0,1]
@@ -937,6 +965,13 @@ class HLFormer_VMR(nn.Module):
             pred_spans, vid_feat, src_vid_mask,
             txt_rep=global_rep)                               # (B, Q, 2)
 
+        # ---- 5c. Learned gate: blend coarse and refined spans --------
+        # gate ≈ 0.27 at ep0 (refine_gate.bias=-1.0); grows as training progresses.
+        # This removes unconditional refinement application, preventing the
+        # boundary_refine loss-coef ramp from starving the coarse decoder gradient.
+        gate = torch.sigmoid(self.refine_gate(dec_out))         # (B, Q, 1)
+        pred_spans_final = gate * pred_spans_refined + (1.0 - gate) * pred_spans  # (B, Q, 2)
+
         # ---- 6. Saliency (positive pair) -----------------------------
         saliency_scores = (
             self.saliency_proj1(vid_feat)
@@ -967,8 +1002,9 @@ class HLFormer_VMR(nn.Module):
         # ---- 9. Collect output ---------------------------------------
         out = {
             "pred_logits":         pred_logits,
-            "pred_spans":          pred_spans,
-            "pred_spans_refined":  pred_spans_refined,  # (B, Q, 2) – locally refined boundaries
+            "pred_spans":          pred_spans_final,           # gated coarse+refined blend
+            "pred_spans_refined":  pred_spans_refined,  # (B, Q, 2) – raw refined (for boundary loss)
+            "pred_refine_gate":    gate,                # (B, Q, 1) – in [0,1], diagnostic
             "saliency_scores":     saliency_scores,
             "saliency_scores_neg": saliency_scores_neg,
             "video_mask":          src_vid_mask,
