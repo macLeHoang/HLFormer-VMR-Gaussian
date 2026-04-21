@@ -115,6 +115,10 @@ cfg["iou_thresholds"] = [0.5, 0.7]   # for R1@IoU metric
 cfg["nms_thresh"]     = 0.5          # NMS IoU threshold for post-processing
 cfg["top_k"]          = 5            # keep top-K spans before NMS
 
+# ---- Validation schedule -------------------------------------------------
+cfg["val_interval"]         = 5   # validate every N epochs before val_dense_from_epoch
+cfg["val_dense_from_epoch"] = 40  # switch to per-epoch validation from this epoch
+
 
 def get_cfg_defaults():
     os.makedirs(cfg["model_root"], exist_ok=True)

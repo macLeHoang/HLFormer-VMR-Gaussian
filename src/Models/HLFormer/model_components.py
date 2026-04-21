@@ -131,12 +131,7 @@ class HLFormerBlock(nn.Module):
         self.e_attns = nn.ModuleList()
         self.e_attns.append(EuclideanAttentionBlock(config))
         for i in range(1, self.num_block + 1):
-            wid = 2 ** (i + 2)
-            self.e_attns.append(EuclideanAttentionBlock(config, wid=wid))
-        # Second half: mirror same window pattern (replaces Lorentz branches)
-        self.e_attns.append(EuclideanAttentionBlock(config))
-        for i in range(1, self.num_block + 1):
-            wid = 2 ** (i + 2)
+            wid = 2 ** (i + 1)
             self.e_attns.append(EuclideanAttentionBlock(config, wid=wid))
 
         self.ca = CrossAttention(config)
@@ -281,6 +276,8 @@ class EuclideanGaussianAttention(nn.Module):
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
         self.wid = wid
         self._gauss_cache = {}
+        _num_block = config.attention_num // 2 - 1
+        self.gauss_divisor = 2 ** (_num_block + 1) + 1
 
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)  # (N, L, nh, dh)
@@ -293,7 +290,7 @@ class EuclideanGaussianAttention(nn.Module):
             return self._gauss_cache[cache_key]
 
         center = torch.arange(props_len, device=device, dtype=dtype) / props_len
-        width_t = (width * torch.ones(props_len, device=device, dtype=dtype)).unsqueeze(-1).clamp(1e-2) / 17
+        width_t = (width * torch.ones(props_len, device=device, dtype=dtype)).unsqueeze(-1).clamp(1e-2) / self.gauss_divisor
         weight = torch.linspace(0, 1, props_len, device=device, dtype=dtype)
         weight = weight.view(1, -1).expand(center.size(0), -1)
         center = center.unsqueeze(-1)

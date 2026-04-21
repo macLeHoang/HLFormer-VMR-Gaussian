@@ -15,7 +15,7 @@ cfg = dict(_qvh.cfg)   # inherit defaults, then override
 
 cfg["seed"]          = 2026
 
-cfg["model_name"]    = "GaussianFormer_VMR_v1"
+cfg["model_name"]    = "GaussianFormer_VMR_v2"
 cfg["dataset_name"]  = "charades_sta"
 cfg["dset_name"]     = "charades_sta"
 
@@ -52,12 +52,12 @@ cfg["v_feat_len_mode"] = "max"
 cfg["hidden_size"]    = 384   # v30: restored to 384; v28=320 hit capacity ceiling
 cfg["n_heads"]        = 6     # 384/8=48 per head
 cfg["num_queries"]    = 10    # v37: increase proposal capacity for better candidate coverage
-cfg["dec_layers"]     = 3
+cfg["dec_layers"]     = 4
 cfg["input_drop"]     = 0.25
 cfg["drop"]           = 0.15
 cfg["txt_drop_ratio"] = 0.1
-cfg["t2v_layers"]     = 3
-cfg["attention_num"]  = 6
+cfg["t2v_layers"]     = 4
+cfg["attention_num"]  = 4
 cfg["pos_enc_type"]   = "trainable"
 cfg["sft_factor"]     = 0.1   # v11=0.06; stronger query-conditioned feature shift
 cfg["weight_token_mode"] = "hybrid"       # global | mean | hybrid
@@ -87,10 +87,10 @@ cfg["contrastive_align_loss_coef"] = 0.15  # v33: 0.05→0.15; cross-modal align
 # epoch 13, meaning the model memorises batch-level text identity rather than learning
 # span-text alignment.  0.3 gives softer gradients; loss should stabilise around 2.0–2.5
 # (log(32)≈3.47 at random, ~1.5–2.0 at good discrimination without memorisation).
-cfg["temperature"]                 = 0.15  # v31: was 0.3; sharper contrastive discrimination
+cfg["temperature"]                 = 0.07  # sharpened from 0.15; faster NCE convergence with real cross-sample negatives (B=32)
 
 # ---- Saliency ------------------------------------------------------------
-cfg["lw_saliency"]     = 0.2   # v34: 0.2→0.05; saliency doesn't contribute to R1, redirect budget to span losses.
+cfg["lw_saliency"]     = 0.05  # v34: 0.2→0.05; saliency doesn't contribute to R1, redirect budget to span losses.
 cfg["saliency_margin"] = 1.0
 
 # ---- Loss weights --------------------------------------------------------
@@ -112,7 +112,7 @@ cfg["boundary_refine_coef"]           = 1.0   # phase-0 default; schedule ramps 
 cfg["boundary_refine_giou_coef"]      = 1.0
 cfg["boundary_refine_window"]         = 16     # v34: at max_v_l=77, sigma=16/154≈0.10 (10% of video); tight enough for precise boundary pooling
 cfg["boundary_refine_learnable_sigma"] = True
-cfg["boundary_refine_max_delta"]      = 0.2
+cfg["boundary_refine_max_delta"]      = 0.15  # reduced from 0.2: less over-correction on borderline R1@0.7 predictions
 cfg["alpha_iou_alpha"]                = 2.0   # v34: 2.5→3.0; stronger gradient amplification in 0.5-0.7 IoU zone
 
 # aux_loss_scale starts low: early decoder layers produce near-zero IoU targets,
@@ -132,12 +132,12 @@ cfg["top_k"]      = 10  # keep all query candidates before NMS (matches num_quer
 cfg["nms_thresh"] = 0.6  # looser NMS to preserve near-duplicate high-IoU candidates for top-1 selection
 
 # ---- Optimizer -----------------------------------------------------------
-cfg["lr"]            = 1.5e-4  # v34: 1e-4→2e-4; stronger gradient signal, more budget before cosine trough
-cfg["lr_vid_enc"]    = 0.75e-4   # v34: 5e-5→1e-4; proportional to lr increase
+cfg["lr"]            = 1e-4  # v34: 1e-4→2e-4; stronger gradient signal, more budget before cosine trough
+cfg["lr_vid_enc"]    = 0.5e-4   # v34: 5e-5→1e-4; proportional to lr increase
 cfg["lr_drop"]       = 30     # kept for backward compat; unused when cosine_T0 > 0
 cfg["lr_gamma"]      = 0.5    # kept for backward compat
 cfg["warmup_epochs"] = 5
-cfg["cosine_T0"]     = 35
+cfg["cosine_T0"]     = 40
 cfg["cosine_Tmult"]  = 2      # v32: NEW; second cycle = 60 epochs (total ~90 before 2nd restart)
 cfg["cosine_eta_min_ratio"] = 0.01  # v32: NEW; min LR = 1% of base at cycle trough
 cfg["wd"]            = 5e-5   # v32: 5e-6→1e-4; 20x increase to regularize weights (5e-6 is effectively zero)
@@ -147,7 +147,7 @@ cfg["grad_clip"]     = 0.3
 cfg["use_ema"]       = True   # v32: NEW; exponential moving average smooths val fluctuations (+1-2 R1)
 cfg["ema_decay"]     = 0.999
 cfg["n_epoch"]       = 100
-cfg["max_es_cnt"]    = 20     # v17→v18: give more room after LR drop
+cfg["max_es_cnt"]    = 30     # raised from 20: survive cosine LR restart plateaus
 cfg["batchsize"]     = 32
 
 # ---- DataLoader ----------------------------------------------------------
@@ -175,6 +175,10 @@ cfg["aug_schedule"] = [
 ]
 
 cfg["iou_thresholds"] = [0.3, 0.5, 0.7]
+
+# ---- Validation schedule -------------------------------------------------
+cfg["val_freq"]       = 3     # validate every 5 epochs before val_full_epoch
+cfg["val_full_epoch"] = 30   # validate every epoch from epoch 30 onward (covers phase transition window)
 
 # ---- Loss schedule -------------------------------------------------------
 # Each entry: (from_epoch, {cfg_key: new_value, ...})
@@ -208,16 +212,20 @@ cfg["loss_schedule"] = [
         "boundary_refine_giou_coef":   3.0,
     }),
     (20, {
-        "boundary_refine_coef":        4.5,
+        "boundary_refine_coef":        3.5,   # held lower during cosine LR restart at ep25
+        "boundary_refine_giou_coef":   3.5,
+    }),
+    (30, {
+        "boundary_refine_coef":        4.5,   # advance after LR restart stabilizes
         "boundary_refine_giou_coef":   4.5,
+        "set_cost_class":              2.2,   # matching cost ramp moved earlier (class_error stable by ep21)
+        "set_cost_giou":               2.2,
     }),
     (40, {
         "span_loss_coef":              9.5,
         "giou_loss_coef":              6.2,
         "boundary_refine_coef":        5.0,
         "boundary_refine_giou_coef":   5.0,
-        "set_cost_class":              2.2,
-        "set_cost_giou":               2.2,
     }),
     (50, {
         "span_loss_coef":              9.0,

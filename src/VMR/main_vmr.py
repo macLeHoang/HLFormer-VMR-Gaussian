@@ -388,11 +388,12 @@ def log_metrics(logger, epoch, train_loss, metrics, best_metrics, avg_components
         logger.info("  Loss components (epoch avg):")
         for k, v in main.items():
             logger.info(f"    {k}: {v:.4f}")
-    for k, v in metrics.items():
-        logger.info(f"  {k}: {v:.2f}")
-    logger.info("  Best so far:")
-    for k, v in best_metrics.items():
-        logger.info(f"    {k}: {v:.2f}")
+    if metrics:
+        for k, v in metrics.items():
+            logger.info(f"  {k}: {v:.2f}")
+        logger.info("  Best so far:")
+        for k, v in best_metrics.items():
+            logger.info(f"    {k}: {v:.2f}")
     logger.info("=" * 80)
 
 
@@ -437,9 +438,9 @@ def main():
     # ---------- Checkpoint resume ---------------------------------------------
     current_epoch      = -1
     best_metrics       = {"primary": 0.0}
-    # best_sal_metrics   = {"hl_mAP": 0.0}
+    metrics            = {}   # retains last validated epoch's metrics for last.pt on skipped epochs
     optimizer          = build_optimizer(model, cfg)
-    scheduler       = build_scheduler(optimizer, cfg)
+    scheduler          = build_scheduler(optimizer, cfg)
 
     _resume_ema_state = None   # applied after EMA is constructed below
     if args.resume:
@@ -502,31 +503,42 @@ def main():
         scheduler.step()
 
         # --- Validate (use EMA model if available) ---
-        eval_model = ema.module if ema is not None else model
-        with torch.no_grad():
-            metrics = val_one_epoch(epoch, val_loader, eval_model, cfg, device, logger)
+        val_freq       = cfg.get("val_freq", 1)
+        val_full_epoch = cfg.get("val_full_epoch", 0)
+        do_validate = (
+            epoch >= val_full_epoch
+            or epoch % val_freq == 0
+            or epoch == cfg["n_epoch"] - 1
+        )
 
-        log_metrics(logger, epoch, train_loss, metrics, best_metrics, avg_components=loss_components)
+        if do_validate:
+            eval_model = ema.module if ema is not None else model
+            with torch.no_grad():
+                metrics = val_one_epoch(epoch, val_loader, eval_model, cfg, device, logger)
+
+        log_metrics(logger, epoch, train_loss, metrics if do_validate else None,
+                    best_metrics, avg_components=loss_components)
 
         # --- Checkpoint & early stopping ---
         raw_model = model.module if isinstance(model, nn.DataParallel) else model
 
-        primary = metrics.get("primary", 0.0)
-        if primary > best_metrics.get("primary", 0.0):
-            best_metrics = metrics
-            es_cnt = 0
-            ckpt_path = os.path.join(cfg["model_root"], "best.ckpt")
-            # Save EMA model as the checkpoint when available (better generalization)
-            save_model = ema.module if ema is not None else raw_model
-            save_ckpt(save_model, optimizer, scheduler, cfg, ckpt_path, epoch, best_metrics)
-            logger.info(f"  New best checkpoint saved -> {ckpt_path}"
-                        + (" (EMA)" if ema is not None else ""))
-        else:
-            es_cnt += 1
-            logger.info(f"  No improvement ({es_cnt}/{cfg['max_es_cnt']})")
-            if cfg["max_es_cnt"] != -1 and es_cnt > cfg["max_es_cnt"]:
-                logger.info("Early stopping triggered.")
-                break
+        if do_validate:
+            primary = metrics.get("primary", 0.0)
+            if primary > best_metrics.get("primary", 0.0):
+                best_metrics = metrics
+                es_cnt = 0
+                ckpt_path = os.path.join(cfg["model_root"], "best.ckpt")
+                # Save EMA model as the checkpoint when available (better generalization)
+                save_model = ema.module if ema is not None else raw_model
+                save_ckpt(save_model, optimizer, scheduler, cfg, ckpt_path, epoch, best_metrics)
+                logger.info(f"  New best checkpoint saved -> {ckpt_path}"
+                            + (" (EMA)" if ema is not None else ""))
+            else:
+                es_cnt += 1
+                logger.info(f"  No improvement ({es_cnt}/{cfg['max_es_cnt']})")
+                if cfg["max_es_cnt"] != -1 and es_cnt > cfg["max_es_cnt"]:
+                    logger.info("Early stopping triggered.")
+                    break
 
         # --- Separate saliency checkpoint (hl_mAP) ---
         # hl_map = metrics.get("hl_mAP", 0.0)

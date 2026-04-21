@@ -379,8 +379,10 @@ def evaluate_vmr(model, dataloader, device, cfg):
     # Convenience scalar: primary metric for early stopping.
     # Average of R1@0.5 and R1@0.7 so checkpointing improves on both thresholds,
     # not just the easier one.
-    r1_05 = metrics.get("R1@0.5", metrics.get(f"R1@{iou_thresholds[0]}", 0.0))
-    r1_07 = metrics.get("R1@0.7", metrics.get(f"R1@{iou_thresholds[-1]}", 0.0))
-    metrics["primary"] = (r1_05 + r1_07) / 2.0
+    r1_05  = metrics.get("R1@0.5",  metrics.get(f"R1@{iou_thresholds[0]}",  0.0))
+    r1_07  = metrics.get("R1@0.7",  metrics.get(f"R1@{iou_thresholds[-1]}", 0.0))
+    map_05 = metrics.get("mAP@0.5", 0.0)
+    map_07 = metrics.get("mAP@0.7", 0.0)
+    metrics["primary"] = 0.5 * (r1_05 + r1_07) + 0.25 * (map_05 + map_07)
 
     return metrics
