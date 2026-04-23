@@ -1,5 +1,5 @@
 """
-HLFormer-VMR: HLFormer extended for Video Moment Retrieval.
+GaussianFormer-VMR: GaussianFormer extended for Video Moment Retrieval.
 
 Architecture:
   1. Feature projection: vid/txt -> hidden_size  (LinearLayer + TrainablePosEnc)
@@ -7,9 +7,9 @@ Architecture:
        [global_token | video] as query, text as key/value.
        Global token is a learned parameter prepended to the video sequence;
        it accumulates cross-modal context through all T2V layers.
-       After T2V: global token extracted for saliency, video passed to HLFormerBlock.
-  3. Video Encoder:   HLFormerBlock — 4 Euclidean Gaussian + 4 Hyperbolic Lorentz
-                      branches, per-position learned fusion weights.
+       After T2V: global token extracted for saliency, video passed to GaussianBlock.
+  3. Video Encoder:   GaussianBlock — multi-scale Euclidean Gaussian attention with
+                      per-position learned branch fusion.
   4. Decoder: VMRDecoder — iterative reference-point refinement (QD-DETR style).
        - VMRDecoderLayer with sine-conditioned cross-attention queries.
        - bbox_embed MLP refines reference points at each layer.
@@ -20,7 +20,6 @@ Architecture:
   5. Prediction heads: class head (fg/bg) + spans from bbox_embed.
   6. Saliency head: dot-product scoring with global_rep from T2V.
   7. Contrastive alignment (optional): NCE loss aligning query slots with text.
-  8. Hyperbolic entailment loss (optional, from HLFormer).
 """
 
 import copy
@@ -34,7 +33,7 @@ from easydict import EasyDict as edict
 from Models.HLFormer.model_components import (
     LinearLayer,
     TrainablePositionalEncoding,
-    HLFormerBlock,
+    GaussianBlock,
 )
 
 
@@ -239,7 +238,7 @@ class VMRDecoderLayer(nn.Module):
         self.drop3 = nn.Dropout(dropout)
 
     def forward(self, tgt, memory, query_pos, sine_embed,
-                memory_key_padding_mask=None):
+                memory_key_padding_mask=None, cross_attn_bias=None):
         """
         Args:
             tgt:                    (B, Q, H)
@@ -247,6 +246,7 @@ class VMRDecoderLayer(nn.Module):
             query_pos:              (B, Q, H) — positional signal from ref_point_head
             sine_embed:             (B, Q, H) — sine embeddings from reference points
             memory_key_padding_mask:(B, L) bool, True = padded
+            cross_attn_bias:        (B, L_mem) optional additive bias over memory keys
         """
         # Self-attention
         q  = self.sa_qcontent(tgt) + self.sa_qpos(query_pos)
@@ -259,7 +259,16 @@ class VMRDecoderLayer(nn.Module):
         q2  = self.ca_qcontent(tgt) + self.ca_qpos_sine(sine_embed)
         k2  = self.ca_kcontent(memory)
         v2  = self.ca_v(memory)
+        # Build additive attn_mask for cross-attention if saliency bias provided
+        ca_attn_mask = None
+        if cross_attn_bias is not None:
+            B, L_mem = cross_attn_bias.shape
+            nh = self.cross_attn.num_heads
+            Lq = tgt.shape[1]  # batch_first=True, so dim 1 is query length
+            bias = cross_attn_bias.view(B, 1, 1, L_mem).expand(B, nh, Lq, L_mem)
+            ca_attn_mask = bias.reshape(B * nh, Lq, L_mem)
         tgt2, _ = self.cross_attn(q2, k2, v2,
+                                   attn_mask=ca_attn_mask,
                                    key_padding_mask=memory_key_padding_mask)
         tgt = self.norm2(tgt + self.drop2(tgt2))
 
@@ -278,7 +287,7 @@ class VMRDecoder(nn.Module):
         self.layers          = nn.ModuleList(
             [copy.deepcopy(decoder_layer) for _ in range(num_layers)])
         self.norm            = nn.LayerNorm(H)
-        self.ref_point_head  = MLP(H, H, H, 2)   # sine_embed -> query pos signal
+        self.ref_point_head  = nn.ModuleList([MLP(H, H, H, 2) for _ in range(num_layers)])   # sine_embed -> query pos signal
         # Per-layer query_scale: each decoder layer conditions its own positional
         # scaling on content, matching the per-layer bbox_embed design.
         self.query_scale     = nn.ModuleList([MLP(H, H, H, 2) for _ in range(num_layers)])
@@ -292,13 +301,15 @@ class VMRDecoder(nn.Module):
             nn.init.zeros_(embed.layers[-1].weight)
             nn.init.zeros_(embed.layers[-1].bias)
 
-    def forward(self, tgt, memory, memory_key_padding_mask, reference_points):
+    def forward(self, tgt, memory, memory_key_padding_mask, reference_points,
+                cross_attn_bias=None):
         """
         Args:
             tgt:                    (B, Q, H)  — initial query content
             memory:                 (B, L, H)  — encoder memory
             memory_key_padding_mask:(B, L) bool — True = padded
             reference_points:       (B, Q, 2)  — initial refs in [0, 1]
+            cross_attn_bias:        (B, L_mem) optional additive bias over memory keys
 
         Returns:
             final_out:       (B, Q, H)       — normed last-layer output
@@ -312,12 +323,13 @@ class VMRDecoder(nn.Module):
             # Positional signal from current reference points
             sine_embed = gen_sineembed_for_position(
                 reference_points, self._H)          # (B, Q, H)
-            query_pos  = self.ref_point_head(sine_embed)    # (B, Q, H)
+            query_pos  = self.ref_point_head[i](sine_embed)    # (B, Q, H)
             scale      = self.query_scale[i](tgt)            # (B, Q, H)
             query_pos  = query_pos * scale
 
             tgt = layer(tgt, memory, query_pos, sine_embed,
-                        memory_key_padding_mask=memory_key_padding_mask)
+                        memory_key_padding_mask=memory_key_padding_mask,
+                        cross_attn_bias=cross_attn_bias)
 
             # Refine reference points — use this layer's own bbox_embed
             delta          = self.bbox_embed[i](tgt)                         # (B, Q, 2)
@@ -326,9 +338,7 @@ class VMRDecoder(nn.Module):
 
             if i < len(self.layers) - 1:
                 aux_list.append(tgt)                 # save unnormed for aux loss
-                reference_points = new_refs.detach()  # decouple per-layer bbox_embed gradients
-            else:
-                reference_points = new_refs
+            reference_points = new_refs   # gradient flows through all layers for high-IoU precision
 
         return self.norm(tgt), aux_list, spans_per_layer
 
@@ -421,10 +431,12 @@ class BoundaryRefinementHead(nn.Module):
     """
 
     def __init__(self, H: int, window_frames: int = 8, max_delta: float = 0.1,
-                 max_v_l: int = 128, learnable_sigma: bool = True):
+                 max_v_l: int = 128, learnable_sigma: bool = True,
+                 num_passes: int = 1):
         super().__init__()
         self.max_delta        = max_delta
         self.learnable_sigma  = learnable_sigma
+        self.num_passes       = max(int(num_passes), 1)
         self._H               = H
         self._sigma_ref_len   = float(max_v_l)
         # Base Gaussian sigma per boundary in normalized [0,1] space.
@@ -456,41 +468,28 @@ class BoundaryRefinementHead(nn.Module):
         vid_feat:   torch.Tensor,          # (B, L, H)
         vid_mask:   torch.Tensor,          # (B, L)     1=valid
         txt_rep:    torch.Tensor = None,   # (B, H)     cross-modal global rep (optional)
-    ) -> torch.Tensor:                     # (B, Q, 2)  refined center/width in [0, 1]
+    ):                                     # -> (Tensor(B,Q,2), list[Tensor(B,Q,2)])
         B, Q, _ = pred_spans.shape
         L, H    = vid_feat.shape[1], vid_feat.shape[2]
         dev     = vid_feat.device
 
         start = (pred_spans[..., 0] - pred_spans[..., 1] / 2).clamp(0., 1.)  # (B, Q)
         end   = (pred_spans[..., 0] + pred_spans[..., 1] / 2).clamp(0., 1.)  # (B, Q)
-        width = pred_spans[..., 1]                                             # (B, Q)
 
-        # Per-query sigma: base + width-scale * width + text-offset
-        # All conditioning terms are zero-init, so ep0 = pure scalar base sigma.
+        # Pre-compute fixed quantities shared across passes.
         t_pos   = torch.linspace(0., 1., L, device=dev)         # (L,)
         min_sig = 1.0 / (4.0 * L)                               # floor: 0.25 frames
 
         if txt_rep is not None:
             # Bound text offset to ±0.5 * log_range so sigma_txt_proj can't explode.
-            # log_range = log(max_sigma / min_sigma); text can shift sigma by at most
-            # half that range in log-space. The post-hoc clamp is kept as a safety net
-            # but no longer hides unbounded txt_off gradients.
-            _log_range = math.log(max(float(L) * min_sig * 4.0, 1.0 + 1e-6))  # ≈ log(1) = 0 at min, grows with L
+            _log_range = math.log(max(float(L) * min_sig * 4.0, 1.0 + 1e-6))
             txt_off = torch.tanh(self.sigma_txt_proj(txt_rep)) * (0.5 * _log_range)  # (B, 2)
             txt_off_s = txt_off[:, 0:1]                          # (B, 1)
             txt_off_e = txt_off[:, 1:2]                          # (B, 1)
+            txt_expand = txt_rep.unsqueeze(1).expand(-1, Q, -1)  # (B, Q, H)
         else:
             txt_off_s = txt_off_e = torch.zeros(B, 1, device=dev, dtype=vid_feat.dtype)
-
-        log_sigma_s = (self.log_sigma_start
-                       + self.sigma_width_scale_start * width
-                       + txt_off_s)                              # (B, Q)
-        log_sigma_e = (self.log_sigma_end
-                       + self.sigma_width_scale_end   * width
-                       + txt_off_e)                              # (B, Q)
-        # len_scale = self._sigma_ref_len / float(L)
-        sigma_s = (log_sigma_s.exp()).clamp(min=min_sig)           # (B, Q)
-        sigma_e = (log_sigma_e.exp()).clamp(min=min_sig)           # (B, Q)
+            txt_expand = torch.zeros(B, Q, H, device=dev, dtype=vid_feat.dtype)
 
         def _pool(anchor, sigma):
             # anchor: (B, Q), sigma: (B, Q), returns (B, Q, H)
@@ -500,33 +499,53 @@ class BoundaryRefinementHead(nn.Module):
             w = w / (w.sum(-1, keepdim=True).clamp(min=1e-8))
             return torch.einsum("bql,blh->bqh", w, vid_feat)  # (B, Q, H)
 
-        start_feat = _pool(start, sigma_s)   # (B, Q, H)
-        end_feat   = _pool(end,   sigma_e)   # (B, Q, H)
+        all_passes = []  # list of (B, Q, 2) tensors, one per pass
 
-        # Joint prediction: start and end deltas conditioned on both boundaries + text.
-        # txt_rep (or zeros) appended so the MLP learns query-specific shifts.
-        if txt_rep is not None:
-            txt_expand = txt_rep.unsqueeze(1).expand(-1, Q, -1)  # (B, Q, H)
-        else:
-            txt_expand = torch.zeros(B, Q, H, device=dev, dtype=vid_feat.dtype)
-        joint_feat = torch.cat([start_feat, end_feat, txt_expand], dim=-1)   # (B, Q, 3H)
-        deltas     = torch.tanh(self.joint_mlp(joint_feat)) * self.max_delta  # (B, Q, 2)
-        delta_s    = deltas[..., 0]                                           # (B, Q)
-        delta_e    = deltas[..., 1]                                           # (B, Q)
+        for _pass_idx in range(self.num_passes):
+            # Per-pass sigma: recomputed from current (start, end) so wider spans
+            # get a wider pooling window each iteration.
+            width = (end - start).clamp(min=1e-6)              # (B, Q)
 
-        start_r  = (start + delta_s).clamp(0., 1.)
-        end_r    = (end   + delta_e).clamp(0., 1.)
-        center_r = (start_r + end_r) / 2.0
-        width_r  = (end_r - start_r).clamp(min=1e-6)
-        return torch.stack([center_r, width_r], dim=-1)        # (B, Q, 2)
+            log_sigma_s = (self.log_sigma_start
+                           + self.sigma_width_scale_start * width
+                           + txt_off_s)                        # (B, Q)
+            log_sigma_e = (self.log_sigma_end
+                           + self.sigma_width_scale_end   * width
+                           + txt_off_e)                        # (B, Q)
+            sigma_s = log_sigma_s.exp().clamp(min=min_sig)     # (B, Q)
+            sigma_e = log_sigma_e.exp().clamp(min=min_sig)     # (B, Q)
+
+            start_feat = _pool(start, sigma_s)                 # (B, Q, H)
+            end_feat   = _pool(end,   sigma_e)                 # (B, Q, H)
+
+            # Joint prediction: start and end deltas conditioned on both
+            # boundaries + text.  Shared weights across passes.
+            joint_feat = torch.cat([start_feat, end_feat, txt_expand], dim=-1)  # (B, Q, 3H)
+            deltas     = torch.tanh(self.joint_mlp(joint_feat)) * self.max_delta  # (B, Q, 2)
+            delta_s    = deltas[..., 0]                        # (B, Q)
+            delta_e    = deltas[..., 1]                        # (B, Q)
+
+            start_r  = (start + delta_s).clamp(0., 1.)
+            end_r    = (end   + delta_e).clamp(0., 1.)
+            center_r = (start_r + end_r) / 2.0
+            width_r  = (end_r - start_r).clamp(min=1e-6)
+            pass_span = torch.stack([center_r, width_r], dim=-1)  # (B, Q, 2)
+            all_passes.append(pass_span)
+
+            # Update boundaries for next pass.
+            start = start_r
+            end   = end_r
+
+        final_span_cxw = all_passes[-1]                        # (B, Q, 2)
+        return final_span_cxw, all_passes
 
 
 # ---------------------------------------------------------------------------
-# HLFormer-VMR
+# GaussianFormer-VMR
 # ---------------------------------------------------------------------------
 
-class HLFormer_VMR(nn.Module):
-    """Video Moment Retrieval model built on HLFormer's encoder backbone.
+class GaussianFormer_VMR(nn.Module):
+    """Video Moment Retrieval model built on GaussianBlock encoder backbone.
 
     Args:
         config: edict / dict-like with all hyperparameters
@@ -593,6 +612,21 @@ class HLFormer_VMR(nn.Module):
         self.vid_pos_embed = _build_pos_enc(_pos_enc, config.max_v_l, H, config.input_drop)
         self.txt_pos_embed = _build_pos_enc(_pos_enc, config.max_q_l, H, config.input_drop)
 
+        # ---- Optional text transformer encoder --------------------------
+        _txt_enc_layers = int(getattr(config, "txt_enc_layers", 0))
+        if _txt_enc_layers > 0:
+            txt_layer = nn.TransformerEncoderLayer(
+                d_model=config.hidden_size,
+                nhead=config.n_heads,
+                dim_feedforward=4 * config.hidden_size,
+                dropout=getattr(config, "drop", 0.15),
+                batch_first=True,
+                norm_first=False,
+            )
+            self.txt_encoder = nn.TransformerEncoder(txt_layer, num_layers=_txt_enc_layers)
+        else:
+            self.txt_encoder = None
+
         # ---- Global token (prepended to [global | video] for T2V) ------
         #  Accumulates cross-modal context through all T2V layers.
         #  Extracted after T2V as the saliency global representation.
@@ -605,10 +639,10 @@ class HLFormer_VMR(nn.Module):
             T2VEncoderLayer(H, config.n_heads, dropout=config.drop)
             for _ in range(_t2v_layers)])
 
-        # ---- Video encoder (HLFormerBlock — CORE INNOVATION) -----------
-        #  frame_len controls HLFormerBlock's internal Gaussian window size.
+        # ---- Video encoder (GaussianBlock) ---------------------------------
+        #  frame_len controls GaussianBlock's internal Gaussian window size.
         #  When use_global_in_encoder=True the global token is prepended to
-        #  the video sequence before HLFormerBlock, so frame_len = max_v_l+1.
+        #  the video sequence before GaussianBlock, so frame_len = max_v_l+1.
         self._use_global_in_encoder = getattr(config, "use_global_in_encoder", False)
         _frame_len = config.max_v_l + (1 if self._use_global_in_encoder else 0)
         vid_enc_cfg = edict(
@@ -621,8 +655,9 @@ class HLFormer_VMR(nn.Module):
             drop=config.drop,
             attention_num=config.attention_num,
             weight_token_mode=getattr(config, "weight_token_mode", "global"),
-            weight_token_hybrid_init=getattr(config, "weight_token_hybrid_init", 0.7))
-        self.video_encoder = HLFormerBlock(vid_enc_cfg)
+            weight_token_hybrid_init=getattr(config, "weight_token_hybrid_init", 0.7),
+            gauss_bias_mode=getattr(config, "gauss_bias_mode", "add_log"))
+        self.video_encoder = GaussianBlock(vid_enc_cfg)
 
         # ---- Decoder (iterative reference-point refinement) ------------
         decoder_layer = VMRDecoderLayer(H, config.n_heads, dropout=config.drop)
@@ -683,9 +718,11 @@ class HLFormer_VMR(nn.Module):
         _win      = getattr(config, "boundary_refine_window",          16)
         _maxd     = getattr(config, "boundary_refine_max_delta",       0.1)
         _learn_sg = getattr(config, "boundary_refine_learnable_sigma", True)
+        _npasses  = getattr(config, "refine_num_passes",               1)
         self.boundary_refine = BoundaryRefinementHead(H, _win, _maxd,
                                                       max_v_l=config.max_v_l,
-                                                      learnable_sigma=_learn_sg)
+                                                      learnable_sigma=_learn_sg,
+                                                      num_passes=_npasses)
 
         # ---- Contrastive alignment (optional) --------------------------
         self._use_contrastive = getattr(config, "use_contrastive", False)
@@ -694,16 +731,6 @@ class HLFormer_VMR(nn.Module):
             self.ca_proj_query = nn.Linear(H, hdim)
             self.ca_proj_txt   = nn.Linear(H, hdim)
             self.ca_proj_vid   = nn.Linear(H, hdim)
-
-        # ---- Hyperbolic pooling (from HLFormer) ------------------------
-        # Initialize at log(H^-0.5) to match the original HLFormer_Net scaling.
-        # exp(log(H^-0.5)) = H^-0.5 ≈ 0.051 for H=384, keeping projected features
-        # close to the hyperboloid origin for well-behaved cone apertures.
-        _alpha_init = math.log(H ** -0.5)
-        self.video_alpha    = nn.Parameter(torch.tensor(_alpha_init))
-        self.textual_alpha  = nn.Parameter(torch.tensor(_alpha_init))
-        self.video_pool     = nn.Linear(H, 1, bias=False)
-        self.query_pool     = nn.Linear(H, 1, bias=False)
 
         self._init_weights()
 
@@ -721,9 +748,12 @@ class HLFormer_VMR(nn.Module):
         for embed in self.decoder.bbox_embed:
             nn.init.zeros_(embed.layers[-1].weight)
             nn.init.zeros_(embed.layers[-1].bias)
-        # Zero-init joint_mlp final layer so initial deltas=tanh(0)*max_delta=0 (identity start)
-        nn.init.zeros_(self.boundary_refine.joint_mlp.layers[-1].weight)
-        nn.init.zeros_(self.boundary_refine.joint_mlp.layers[-1].bias)
+        # Zero-init for joint_mlp final layer intentionally removed:
+        # zero-init combined with tanh*max_delta clamp starved the head's gradient
+        # (deltas=0 at ep0 → tanh saturation near zero → near-zero gradient back through
+        # the head for many epochs).  Default Kaiming init lets deltas start nonzero so
+        # gradient reaches the head from step 1.  Head contribution is bounded by
+        # boundary_refine_coef=0.5 in the loss schedule.
         # Zero-init text+width conditioning terms so ep0 behaviour = scalar base sigma.
         nn.init.zeros_(self.boundary_refine.sigma_txt_proj.weight)
         nn.init.zeros_(self.boundary_refine.sigma_txt_proj.bias)
@@ -765,24 +795,14 @@ class HLFormer_VMR(nn.Module):
         self.query_embed.weight.data[:, 0] = cx.logit()   # inv_sigmoid of center
         self.query_embed.weight.data[:, 1] = w.logit()    # inv_sigmoid of width
 
-        # Register gradient hooks to enforce alpha <= 0 without corrupting
-        # the optimizer's momentum state (which .data clamping bypasses).
-        # The hook zeroes out any gradient component that would push alpha > 0
-        # when it is already at the boundary, so Adam never accumulates
-        # momentum in the infeasible direction.
-        def _make_neg_clamp_hook(param):
-            def hook(grad):
-                return torch.where(param.data >= 0.0, grad.clamp(max=0.0), grad)
-            return hook
-
-        self.video_alpha.register_hook(_make_neg_clamp_hook(self.video_alpha))
-        self.textual_alpha.register_hook(_make_neg_clamp_hook(self.textual_alpha))
-
     # ------------------------------------------------------------------
     def _encode_query(self, src_txt, src_txt_mask):
-        """Project + pos-encode text features."""
+        """Project + pos-encode + (optionally) transformer-encode text features."""
         txt_feat = self.input_txt_proj(src_txt)
         txt_feat = self.txt_pos_embed(txt_feat)
+        if self.txt_encoder is not None:
+            kpm = (src_txt_mask == 0)              # True = padded
+            txt_feat = self.txt_encoder(txt_feat, src_key_padding_mask=kpm)
         return txt_feat                                      # (B, L_t, H)
 
     def _early_query_fusion(self, vid_feat, txt_feat, vid_mask, txt_mask):
@@ -823,7 +843,7 @@ class HLFormer_VMR(nn.Module):
         return vid_feat, global_rep
 
     def _decode(self, memory, memory_mask, txt_feat=None, txt_mask=None,
-                vid_feat=None, vid_mask=None):
+                vid_feat=None, vid_mask=None, cross_attn_bias=None):
         """Run the iterative VMRDecoder with content-adaptive query initialisation.
 
         Args:
@@ -833,6 +853,7 @@ class HLFormer_VMR(nn.Module):
             txt_mask:     (B, L_t)    — 1=valid, 0=padded
             vid_feat:     (B, L_v, H) — video-only encoder output (for CAQ attn)
             vid_mask:     (B, L_v)    — 1=valid, 0=padded
+            cross_attn_bias: (B, L_mem) optional additive saliency bias over memory keys
         """
         B, Q = memory.shape[0], self.query_content_embed.weight.shape[0]
         mem_pad = (memory_mask == 0)                             # (B, L) True=pad
@@ -870,21 +891,22 @@ class HLFormer_VMR(nn.Module):
             # 3. Add attended features to base content embedding.
             tgt = tgt + caq_out
 
-            # 4. Content-adaptive reference points: use text mean (not video-attended
-            #    content) to set the initial position prior.  This decouples WHAT
-            #    the query attends to (video content via caq_attn) from WHERE it
-            #    points initially (text prior via caq_ref_init).
-            #    Zero-init of caq_ref_init.layers[-1] means offset=0 at ep0.
-            ref_offset = self.caq_ref_init(txt_mean).unsqueeze(1).expand(B, Q, 2)  # (B, Q, 2)
-            base_ref   = self.query_embed.weight.sigmoid() \
-                             .unsqueeze(0).expand(B, -1, -1)    # (B, Q, 2)
+            # 4. Content-adaptive reference points: combine per-query offset from
+            #    caq_out with a text-global offset from caq_ref_init(txt_mean).
+            #    Zero-init of both final layers means offset=0 at ep0.
+            ref_offset_q = self.caq_ref_head(caq_out)                                 # (B, Q, 2) per-query
+            ref_offset_t = self.caq_ref_init(txt_mean).unsqueeze(1).expand(B, Q, 2)   # (B, Q, 2) text-global
+            ref_offset   = ref_offset_q + ref_offset_t
+            base_ref     = self.query_embed.weight.sigmoid() \
+                               .unsqueeze(0).expand(B, -1, -1)    # (B, Q, 2)
             # Add offset in inv-sigmoid space then re-sigmoid to stay in [0,1]
             ref = (inverse_sigmoid(base_ref) + ref_offset).sigmoid()  # (B, Q, 2)
         else:
             ref = self.query_embed.weight.sigmoid() \
                       .unsqueeze(0).expand(B, -1, -1)           # (B, Q, 2)
 
-        return self.decoder(tgt, memory, mem_pad, ref)
+        return self.decoder(tgt, memory, mem_pad, ref,
+                            cross_attn_bias=cross_attn_bias)
 
     # ------------------------------------------------------------------
     def forward(self, src_vid, src_vid_mask, src_txt, src_txt_mask):
@@ -920,12 +942,12 @@ class HLFormer_VMR(nn.Module):
             vid_feat_proj = vid_feat_proj + torch.randn_like(vid_feat_proj) * _feat_noise_std
             txt_feat      = txt_feat      + torch.randn_like(txt_feat)      * _feat_noise_std
 
-        # ---- 3. T2V fusion + HLFormerBlock ---------------------------
+        # ---- 3. T2V fusion + GaussianBlock ---------------------------
         vid_feat, global_rep = self._early_query_fusion(
             vid_feat_proj, txt_feat, src_vid_mask, src_txt_mask)
 
         if self._use_global_in_encoder:
-            # Prepend global token: [global | video] → HLFormerBlock → split
+            # Prepend global token: [global | video] → GaussianBlock → split
             g_in    = global_rep.unsqueeze(1)                        # (B, 1, H)
             g_mask  = torch.ones(vid_feat.shape[0], 1,
                                  dtype=src_vid_mask.dtype,
@@ -950,18 +972,53 @@ class HLFormer_VMR(nn.Module):
         else:
             memory      = vid_feat
             memory_mask = src_vid_mask
+
+        # ---- 4a. Saliency scores (positive pair) — computed before decode ----
+        # Both vid_feat and global_rep are available here; saliency is used both
+        # as a supervision target (step 6) and to bias decoder cross-attention.
+        saliency_scores = (
+            self.saliency_proj1(vid_feat)
+            * self.saliency_proj2(global_rep).unsqueeze(1)
+        ).sum(dim=-1) / math.sqrt(H)                             # (B, L_v)
+
+        # ---- 4b. Build cross-attention saliency bias for decoder ----------
+        # cross_attn_bias: (B, L_mem) additive log-sigmoid bias injected into
+        # decoder cross-attention over video positions; text positions get 0.
+        # Memory layout is [video | text] (confirmed above).
+        sal_scale = float(getattr(self.config, "sal_prior_scale", 0.0))
+        if sal_scale > 0.0:
+            sal_bias_vid = (
+                torch.log(torch.sigmoid(saliency_scores).clamp_min(1e-6)) * sal_scale
+            )  # (B, L_v)
+            if getattr(self.config, "use_txt_in_memory", True):
+                B_s, L_v = sal_bias_vid.shape
+                L_t = txt_feat.shape[1]
+                # Memory is [vid; txt]: zeros for text positions
+                cross_attn_bias = torch.cat(
+                    [sal_bias_vid,
+                     torch.zeros(B_s, L_t,
+                                 device=sal_bias_vid.device,
+                                 dtype=sal_bias_vid.dtype)],
+                    dim=1,
+                )  # (B, L_v + L_t)
+            else:
+                cross_attn_bias = sal_bias_vid  # (B, L_v)
+        else:
+            cross_attn_bias = None
+
         dec_out, aux_list, spans_per_layer = self._decode(memory, memory_mask,
                                                           txt_feat=txt_feat,
                                                           txt_mask=src_txt_mask,
                                                           vid_feat=vid_feat,
-                                                          vid_mask=src_vid_mask)
+                                                          vid_mask=src_vid_mask,
+                                                          cross_attn_bias=cross_attn_bias)
 
         # ---- 5. Prediction heads -------------------------------------
         pred_logits = self.class_head(dec_out).squeeze(-1)          # (B, Q)
         pred_spans  = spans_per_layer[-1]                        # (B, Q, 2)
 
         # ---- 5b. Boundary refinement (local Gaussian pooling + MLP) --
-        pred_spans_refined = self.boundary_refine(
+        pred_spans_refined, refined_passes = self.boundary_refine(
             pred_spans, vid_feat, src_vid_mask,
             txt_rep=global_rep)                               # (B, Q, 2)
 
@@ -972,13 +1029,7 @@ class HLFormer_VMR(nn.Module):
         gate = torch.sigmoid(self.refine_gate(dec_out))         # (B, Q, 1)
         pred_spans_final = gate * pred_spans_refined + (1.0 - gate) * pred_spans  # (B, Q, 2)
 
-        # ---- 6. Saliency (positive pair) -----------------------------
-        saliency_scores = (
-            self.saliency_proj1(vid_feat)
-            * self.saliency_proj2(global_rep).unsqueeze(1)
-        ).sum(dim=-1) / math.sqrt(H)                             # (B, L_v)
-
-        # ---- 7. Saliency (negative pair — cyclic text shift) ---------
+        # ---- 6. Saliency (negative pair — cyclic text shift) ---------
         #  v31: simplified from full encoder re-run to shifted dot product.
         #  The negative pair only needs to show "mismatched text gives low saliency."
         #  Re-running the full encoder was 40% of forward cost and introduced
@@ -1002,12 +1053,15 @@ class HLFormer_VMR(nn.Module):
         # ---- 9. Collect output ---------------------------------------
         out = {
             "pred_logits":         pred_logits,
-            "pred_spans":          pred_spans_final,           # gated coarse+refined blend
-            "pred_spans_refined":  pred_spans_refined,  # (B, Q, 2) – raw refined (for boundary loss)
-            "pred_refine_gate":    gate,                # (B, Q, 1) – in [0,1], diagnostic
+            "pred_spans":          pred_spans,              # COARSE decoder output (for loss_spans)
+            "pred_spans_refined":        pred_spans_refined,      # (B, Q, 2) – raw refined (for loss_spans_refined)
+            "pred_spans_refined_passes": refined_passes,           # list[Tensor(B,Q,2)] – per-pass spans (deep-supervision)
+            "pred_spans_final":    pred_spans_final,        # gated coarse+refined blend — used at inference
+            "pred_refine_gate":    gate,                    # (B, Q, 1) – in [0,1], diagnostic
             "saliency_scores":     saliency_scores,
             "saliency_scores_neg": saliency_scores_neg,
             "video_mask":          src_vid_mask,
+            "text_mask":           src_txt_mask,            # (B, L_t) – for contrastive-align mask
         }
 
         # ---- 10. Contrastive alignment (optional) --------------------
@@ -1043,7 +1097,7 @@ class HLFormer_VMR(nn.Module):
 # ---------------------------------------------------------------------------
 
 def build_model(cfg):
-    """Build HLFormer_VMR from a config dict."""
+    """Build GaussianFormer_VMR from a config dict."""
     cfg = dict(cfg)
     if cfg.get("use_tef", False):
         stream_dims = cfg.get("v_feat_dims", None)
@@ -1052,4 +1106,4 @@ def build_model(cfg):
             cfg["v_feat_dim"] = sum(cfg["v_feat_dims"])
         else:
             cfg["v_feat_dim"] = cfg.get("v_feat_dim", 0) + 2
-    return HLFormer_VMR(edict(cfg))
+    return GaussianFormer_VMR(edict(cfg))

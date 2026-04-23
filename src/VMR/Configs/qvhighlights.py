@@ -1,5 +1,5 @@
 """
-Configuration for HLFormer-VMR on QVHighlights dataset.
+Configuration for GaussianFormer-VMR on QVHighlights dataset.
 
 QVHighlights data directory should contain:
   highlight_train_release.jsonl
@@ -19,7 +19,7 @@ import yaml
 cfg = {}
 
 # ---- Experiment identity ------------------------------------------------
-cfg["model_name"]   = "HLFormer_VMR"
+cfg["model_name"]   = "GaussianFormer_VMR"
 cfg["dataset_name"] = "qvhighlights"
 cfg["dset_name"]    = "qvhighlights"
 cfg["seed"]         = 2024
@@ -64,7 +64,7 @@ cfg["n_input_proj"]   = 2    # stacked input projection layers (QD-DETR style)
 cfg["initializer_range"] = 0.02
 cfg["pos_enc_type"]   = "trainable"   # "trainable": learned | "sinusoidal": fixed sin/cos
 
-# HLFormerBlock settings (from HLFormer)
+# GaussianBlock settings
 cfg["sft_factor"]     = 0.09
 cfg["attention_num"]  = 8    # total attention branches (all Euclidean Gaussian)
 
@@ -74,7 +74,7 @@ cfg["t2v_layers"]     = 6    # number of stacked T2VEncoderLayer blocks
 # Auxiliary decoder losses (losses from each intermediate decoder layer)
 cfg["aux_loss"]              = True
 cfg["use_txt_in_memory"]     = True   # True=[video|text] in decoder, False=video only (QD-DETR style)
-cfg["use_global_in_encoder"] = False  # True=global token passes through HLFormerBlock (QD-DETR style)
+cfg["use_global_in_encoder"] = False  # True=global token passes through GaussianBlock (QD-DETR style)
 
 # ---- Loss weights --------------------------------------------------------
 cfg["span_loss_coef"]   = 10.0
@@ -97,7 +97,7 @@ cfg["set_cost_giou"]    = 1.0
 
 # ---- Optimizer -----------------------------------------------------------
 cfg["lr"]               = 1e-4
-cfg["lr_vid_enc"]       = 1e-4   # learning rate for video encoder (HLFormerBlock)
+cfg["lr_vid_enc"]       = 1e-4   # learning rate for video encoder (GaussianBlock)
 cfg["lr_drop"]          = 40     # epochs after which LR is multiplied by lr_gamma
 cfg["lr_gamma"]         = 0.1
 cfg["wd"]               = 1e-4   # weight decay

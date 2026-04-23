@@ -1,5 +1,5 @@
 """
-Configuration for HLFormer-VMR on Charades-STA dataset.
+Configuration for GaussianFormer-VMR on Charades-STA dataset.
 
 Charades-STA features:
   Video: SlowFast (2304) + CLIP (512) + BLIP (768)  -> <vid>.npz  (key: "features")
@@ -15,7 +15,7 @@ cfg = dict(_qvh.cfg)   # inherit defaults, then override
 
 cfg["seed"]          = 2026
 
-cfg["model_name"]    = "GaussianFormer_VMR_v2"
+cfg["model_name"]    = "GaussianFormer_VMR_v3"
 cfg["dataset_name"]  = "charades_sta"
 cfg["dset_name"]     = "charades_sta"
 
@@ -46,34 +46,36 @@ cfg["t_feat_dim"]  = sum(cfg["t_feat_dims"])     # 1280
 cfg["max_v_l"]     = 75
 cfg["clip_len"]    = 1.0
 cfg["use_tef"]     = True
-cfg["v_feat_len_mode"] = "max" 
+cfg["v_feat_len_mode"] = "min"
 
 # ---- Model architecture --------------------------------------------------
-cfg["hidden_size"]    = 384   # v30: restored to 384; v28=320 hit capacity ceiling
-cfg["n_heads"]        = 6     # 384/8=48 per head
-cfg["num_queries"]    = 10    # v37: increase proposal capacity for better candidate coverage
-cfg["dec_layers"]     = 4
-cfg["input_drop"]     = 0.15
-cfg["drop"]           = 0.15
+cfg["hidden_size"]    = 256   # v30: restored to 384; v28=320 hit capacity ceiling
+cfg["n_heads"]        = 4     # 384/8=48 per head
+cfg["num_queries"]    = 8     # remediation: 5→8; more queries to prevent gradient starvation in aux decoders
+cfg["dec_layers"]     = 3
+cfg["input_drop"]     = 0.25
+cfg["drop"]           = 0.25
 cfg["txt_drop_ratio"] = 0.1
-cfg["t2v_layers"]     = 4
-cfg["attention_num"]  = 4
+cfg["t2v_layers"]     = 3  # deepened 3->4 to unblock cross-modal fusion
+cfg["attention_num"]  = 5
 cfg["pos_enc_type"]   = "trainable"
-cfg["sft_factor"]     = 0.1   # v11=0.06; stronger query-conditioned feature shift
+cfg["sft_factor"]     = 0.3   # v11=0.06; stronger query-conditioned feature shift
+cfg["gauss_bias_mode"] = "add_log"        # additive log-space Gaussian bias
 cfg["weight_token_mode"] = "hybrid"       # global | mean | hybrid
-cfg["weight_token_hybrid_init"] = 0.7      # gate on global token at init
+cfg["weight_token_hybrid_init"] = 0.5      # gate on global token at init
+cfg["txt_enc_layers"]  = 1                 # scaled from 2 → 1 for fresh run
 
 # v11=False; enabling text-in-memory makes encoder query-conditioned (not just decoder)
 cfg["use_txt_in_memory"]     = True
 cfg["use_global_in_encoder"] = True
 
-cfg["use_refined_spans"] = True
+cfg["use_refined_spans"] = False
 
 # ---- v37 alignment flags ---------------------------------------------------
 # Match and quality-target supervision should follow the same span space used
 # at evaluation time (refined when available), with safe fallback to coarse.
-cfg["match_span_source"]   = "dual"      # coarse | refined | dual
-cfg["refined_cost_weight"] = 0.5         # used only when match_span_source="dual"
+cfg["match_span_source"]   = "coarse"   # remediation: "refined"→"coarse"; prevents matcher churn when refiner is cold early
+cfg["refined_cost_weight"] = 0.0         # ignored under "coarse"; set to 0 for clarity
 cfg["label_span_source"]   = "matched"   # coarse | refined | matched
 
 # ---- Contrastive alignment -----------------------------------------------
@@ -90,8 +92,9 @@ cfg["contrastive_align_loss_coef"] = 0.15  # v33: 0.05→0.15; cross-modal align
 cfg["temperature"]                 = 0.07  # sharpened from 0.15; faster NCE convergence with real cross-sample negatives (B=32)
 
 # ---- Saliency ------------------------------------------------------------
-cfg["lw_saliency"]     = 0.1  # v34: 0.2→0.05; saliency doesn't contribute to R1, redirect budget to span losses.
+cfg["lw_saliency"]     = 0.05  # saliency doesn't contribute to R1, redirect budget to span losses.
 cfg["saliency_margin"] = 1.0
+cfg["sal_prior_scale"] = 0.3   # remediation: 1.0→0.3; reduce saliency prior dominance early in training
 
 # ---- Loss weights --------------------------------------------------------
 cfg["span_loss_coef"]     = 10.0  # v17→v18: boost L1 span signal (dominant early training)
@@ -100,20 +103,23 @@ cfg["boundary_loss_coef"] = 0.0   # disabled: smooth-L1 on (start,end) is redund
                                    # DIoU which supervises the same coordinates; the old
                                    # value of 16.0 was swamping the DIoU gradient 16:1.
                                    # Boundary supervision is kept in the refinement head.
-cfg["label_loss_coef"]    = 2.0   # v33: 4.0→2.0; quality head converges fast, reduce dominance over span losses
+cfg["label_loss_coef"]    = 2.5   # remediation: 3.5→2.5; reduce quality-head dominance to let span losses breathe
 # cfg["label_smoothing"]    = 0.1  # v32: 0.1→0.2; softer targets reduce overconfident predictions
+cfg["final_loss_coef_span"] = 0.0  # refiner disabled
+cfg["final_loss_coef_giou"] = 0.0  # refiner disabled
 
 # ---- Boundary refinement losses (BoundaryRefinementHead, v15) -----------
 # Applied to pred_spans_refined (final layer only, same Hungarian indices).
-# v31: enabled from epoch 0 — the BoundaryRefineHead is zero-initialized so it
-# starts as identity and gradually activates.  With giou_coef=4.0 the model gets
-# direct boundary supervision from the beginning.
-cfg["boundary_refine_coef"]           = 1.0   # phase-0 default; schedule ramps refinement gradually.
-cfg["boundary_refine_giou_coef"]      = 1.0
+# Refiner is auxiliary: constant low coef keeps it contributing without
+# overwhelming the coarse decoder.  Head gradient unblocked by removing
+# zero-init on joint_mlp final layer (vmr_model.py) and raising lr_refiner.
+cfg["boundary_refine_coef"]           = 0.0   # refiner disabled for fresh run
+cfg["boundary_refine_giou_coef"]      = 0.0   # refiner disabled for fresh run
 cfg["boundary_refine_window"]         = 12     # v34: at max_v_l=77, sigma=16/154≈0.10 (10% of video); tight enough for precise boundary pooling
 cfg["boundary_refine_learnable_sigma"] = True
-cfg["boundary_refine_max_delta"]      = 0.08  # tightened from 0.15; late training needs 1-4 frame micro-corrections
-cfg["alpha_iou_alpha"]                = 2.5   # v34: 2.5→3.0; stronger gradient amplification in 0.5-0.7 IoU zone
+cfg["boundary_refine_max_delta"]      = 0.15  # unused when refiner disabled
+cfg["refine_num_passes"]              = 1      # single pass; no iterative update
+cfg["alpha_iou_alpha"]                = 2.0   # static; no ramp
 
 # aux_loss_scale starts low: early decoder layers produce near-zero IoU targets,
 # creating a strong "everything is background" pull if aux losses are weighted heavily.
@@ -123,39 +129,41 @@ cfg["aux_loss_scale"]     = 0.2   # v31: was 0.1; stronger deep supervision from
 # ---- Hungarian matcher ---------------------------------------------------
 # v31: set_cost_class and set_cost_giou raised from 1.0 to 2.0 from start
 # to stabilize matching early (quality predictions are good enough by ep3-5).
-cfg["set_cost_class"]  = 2.0   # v31: was 1.0; stabilize query-target assignment
-cfg["set_cost_span"]   = 10.0  # v17→v18: match span_loss_coef ratio
-cfg["set_cost_giou"]   = 2.0   # v31: was 1.0; IoU-aware matching from start
+cfg["set_cost_class"]  = 3.0   # v31: was 1.0; stabilize query-target assignment
+cfg["set_cost_span"]   = 5.0   # v17→v18: match span_loss_coef ratio
+cfg["set_cost_giou"]   = 4.0   # v31: was 1.0; IoU-aware matching from start
 
 # ---- Post-processing -----------------------------------------------------
-cfg["top_k"]      = 10  # keep all query candidates before NMS (matches num_queries)
-cfg["nms_thresh"] = 0.6  # looser NMS to preserve near-duplicate high-IoU candidates for top-1 selection
+cfg["top_k"]      = 8  # remediation: 10→8; aligned to num_queries=8 to avoid empty candidate slots
+cfg["nms_thresh"] = 0.45  # tighter NMS for Charades short moments
 
 # ---- Optimizer -----------------------------------------------------------
-cfg["lr"]            = 1e-4  # v34: 1e-4→2e-4; stronger gradient signal, more budget before cosine trough
-cfg["lr_vid_enc"]    = 0.5e-4   # v34: 5e-5→1e-4; proportional to lr increase
+cfg["lr"]            = 1.5e-4  # stronger gradient signal, more budget before cosine trough
+cfg["lr_vid_enc"]    = 0.75e-4    # proportional to lr
+cfg["lr_refiner"]    = 1.5e-4    # 3x base lr; pushes boundary_refine head out of dead basin
+cfg["lr_txt_enc"]    = 0.75e-4    # learning rate for text encoder
 cfg["lr_drop"]       = 30     # kept for backward compat; unused when cosine_T0 > 0
 cfg["lr_gamma"]      = 0.5    # kept for backward compat
 cfg["warmup_epochs"] = 5
-cfg["cosine_T0"]     = 30
-cfg["cosine_Tmult"]  = 2      # v32: NEW; second cycle = 60 epochs (total ~90 before 2nd restart)
+cfg["cosine_T0"]     = 35
+cfg["cosine_Tmult"]  = 1      # no second cycle in 50-epoch budget
 cfg["cosine_eta_min_ratio"] = 0.01  # v32: NEW; min LR = 1% of base at cycle trough
-cfg["wd"]            = 5e-5   # v32: 5e-6→1e-4; 20x increase to regularize weights (5e-6 is effectively zero)
+cfg["wd"]            = 1e-4   # v32: 5e-6→1e-4; 20x increase to regularize weights (5e-6 is effectively zero)
 cfg["grad_clip"]     = 0.3
 
 # ---- EMA ----------------------------------------------------------------
 cfg["use_ema"]       = True   # v32: NEW; exponential moving average smooths val fluctuations (+1-2 R1)
-cfg["ema_decay"]     = 0.999
-cfg["n_epoch"]       = 100
-cfg["max_es_cnt"]    = 30     # raised from 20: survive cosine LR restart plateaus
+cfg["ema_decay"]     = 0.995
+cfg["n_epoch"]       = 70
+cfg["max_es_cnt"]    = 15     # tighter: prior run wasted 23+ no-improve epochs
 cfg["batchsize"]     = 32
 
 # ---- DataLoader ----------------------------------------------------------
 cfg["num_workers"] = 2
 
 # ---- Data augmentation (training only) -----------------------------------
-cfg["temporal_crop_ratio"] = 0.2   # v32: randomly crop 20% of video, forces context-invariant localization
-cfg["feat_mask_ratio"]     = 0.15  # v32: randomly mask 15% of clips, prevents reliance on specific frames
+cfg["temporal_crop_ratio"] = 0.25   # v32: randomly crop 20% of video, forces context-invariant localization
+cfg["feat_mask_ratio"]     = 0.25  # v32: randomly mask 15% of clips, prevents reliance on specific frames
 cfg["gt_jitter_frames"]    = 2  # v32: jitter GT boundaries ±2 frames, smooths supervision signal
 cfg["feat_noise_std"]      = 0.0  # v32: Gaussian noise σ added to projected features during training
 
@@ -165,63 +173,38 @@ cfg["aug_schedule"] = [
     (0, {
         "temporal_crop_ratio": 0.2,
         "feat_mask_ratio":     0.15,
-        "gt_jitter_frames":    1,
+        "gt_jitter_frames":    2,
     }),
-    (45, {
+    (35, {
         "temporal_crop_ratio": 0.05,
         "feat_mask_ratio":     0.05,
-        "gt_jitter_frames":    0,
+        "gt_jitter_frames":    1,
     }),
 ]
 
 cfg["iou_thresholds"] = [0.3, 0.5, 0.7]
 
 # ---- Validation schedule -------------------------------------------------
-cfg["val_freq"]       = 3     # validate every 5 epochs before val_full_epoch
-cfg["val_full_epoch"] = 30   # validate every epoch from epoch 30 onward (covers phase transition window)
+cfg["val_freq"]       = 3     # validate every 3 epochs before val_full_epoch
+cfg["val_full_epoch"] = 12   # dense validation from near prior best (ep15)
 
 # ---- Loss schedule -------------------------------------------------------
 # Each entry: (from_epoch, {cfg_key: new_value, ...})
 # apply_loss_schedule() in main_vmr.py reads this and patches criterion.weight_dict
 # and matcher costs at phase boundaries.
 #
-# Phase 1  (ep  0-14): Coarse localization — boundary refine at 1.0 (head warms up via zero-init).
-# Phase 2  (ep 15-29): Boundary refine gently raised to 2.0 — refine head actively correcting.
-# Phase 3  (ep 30-44): Boundary refine capped at 2.5 — coarse decoder stays dominant.
-#                       Capped to avoid the R1@0.7 regression observed when boundary_refine_coef
-#                       exceeded 3.0 while match_span_source='refined' (gradient starvation on
-#                       coarse decoder). With 'dual' matching this is relaxed but kept conservative.
-# Phase 4  (ep 45+  ): IoU-budget rebalance: giou↑, span↓, contrastive↓.
+# Two phases only — no mid-run ramps; previous ramps caused consistent regressions.
+# Phase 1 (ep  0-34): Coarse localization with low constant refine coef.
+# Phase 2 (ep 35+  ): IoU-budget rebalance: giou up, span down, contrastive down.
 #
 # Static cfg values above must match Phase 1 so build_criterion() starts correctly.
 cfg["loss_schedule"] = [
-    (0, {
-        "span_loss_coef":             10.0,
-        "giou_loss_coef":              6.0,
-        "boundary_refine_coef":        1.0,
-        "boundary_refine_giou_coef":   1.0,
-        "contrastive_align_loss_coef": 0.15,
-        "aux_loss_scale":              0.2,
-        "set_cost_class":              2.0,
-        "set_cost_span":              10.0,
-        "set_cost_giou":               2.0,
-    }),
-    (15, {
-        "boundary_refine_coef":        2.0,
-        "boundary_refine_giou_coef":   2.0,
-    }),
-    (30, {
-        "boundary_refine_coef":        2.5,
-        "boundary_refine_giou_coef":   2.5,
-        "set_cost_class":              2.2,
-        "set_cost_giou":               2.2,
-    }),
-    (45, {
-        "span_loss_coef":              9.0,
-        "giou_loss_coef":              7.0,
-        "contrastive_align_loss_coef": 0.05,
-        "aux_loss_scale":              0.1,
-    }),
+    (0,  {'span_loss_coef': 10.0, 'giou_loss_coef': 6.0,
+          'boundary_refine_coef': 0.0, 'boundary_refine_giou_coef': 0.0,
+          'contrastive_align_loss_coef': 0.08, 'aux_loss_scale': 0.2,
+          'set_cost_class': 3.0, 'set_cost_span': 5.0, 'set_cost_giou': 4.0,
+          'alpha_iou_alpha': 2.0}),
+    (30, {'contrastive_align_loss_coef': 0.03, 'aux_loss_scale': 0.1}),
 ]
 
 

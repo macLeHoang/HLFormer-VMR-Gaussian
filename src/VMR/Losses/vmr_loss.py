@@ -176,11 +176,23 @@ class VMRSetCriterion(nn.Module):
         # Combined coarse loss: DIoU handles center alignment (strong gradient when
         # spans do not overlap); Alpha-IoU amplifies gradient in the IoU=[0.5, 0.7)
         # zone that separates R1@0.5 hits from R1@0.7 hits.
-        # v34: 0.5/0.5 → 0.3/0.7 — put 70% of gradient budget on Alpha-IoU to
+        # 0.3/0.7 — put 70% of gradient budget on Alpha-IoU to
         # maximise signal in the 0.5→0.7 IoU transition region (R1@0.7 bottleneck).
-        loss_giou_combined = 0.5 * loss_diou + 0.5 * loss_alpha
+        loss_giou_combined = 0.3 * loss_diou + 0.7 * loss_alpha
 
-        return {"loss_span": loss_l1, "loss_giou": loss_giou_combined, "loss_boundary": loss_boundary}
+        losses = {"loss_span": loss_l1, "loss_giou": loss_giou_combined, "loss_boundary": loss_boundary}
+
+        # ---- Supervision on pred_spans_final (trains the refine_gate) ----
+        if "pred_spans_final" in outputs and outputs["pred_spans_final"] is not None:
+            src_cxw_f = outputs["pred_spans_final"][idx]              # (#matched, 2)
+            src_xx_f  = span_cxw_to_xx(src_cxw_f)
+            loss_l1_final   = F.l1_loss(src_cxw_f, tgt_cxw, reduction="none").mean()
+            loss_diou_final  = diou_temporal_loss(src_xx_f, tgt_xx)
+            loss_alpha_final = alpha_iou_temporal_loss(src_xx_f, tgt_xx, alpha=self.alpha_iou_alpha)
+            losses["loss_span_final"] = loss_l1_final
+            losses["loss_giou_final"] = 0.3 * loss_diou_final + 0.7 * loss_alpha_final
+
+        return losses
 
     def loss_contrastive_align(self, outputs, targets, indices, log=True):
         """QD-DETR style contrastive alignment loss.
@@ -200,7 +212,14 @@ class VMRSetCriterion(nn.Module):
 
         logits = torch.einsum(
             "bmd,bnd->bmn", normalized_img_embed, normalized_text_embed
-        )
+        )                                                  # (B, Q, L_t)
+
+        # Mask padded text tokens before summing so padding does not contribute
+        # to the per-query logit.  text_mask is (B, L_t), 1=valid token.
+        text_mask = outputs.get("text_mask")              # (B, L_t) or None
+        if text_mask is not None:
+            # Zero out padded positions: (B, 1, L_t) broadcast over Q
+            logits = logits * text_mask.unsqueeze(1).float()
         logits = logits.sum(2) / self.temperature          # (B, Q)
 
         idx = self._src_permutation_idx(indices)
@@ -385,18 +404,33 @@ class VMRSetCriterion(nn.Module):
             return {}
 
         idx     = self._src_permutation_idx(indices)
-        src_cxw = outputs["pred_spans_refined"][idx]          # (#matched, 2)
         tgt_cxw = torch.cat(
             [t["spans"][j] for t, (_, j) in zip(targets["span_labels"], indices)],
             dim=0)                                             # (#matched, 2)
+        tgt_xx  = span_cxw_to_xx(tgt_cxw)
 
-        src_xx = span_cxw_to_xx(src_cxw)
-        tgt_xx = span_cxw_to_xx(tgt_cxw)
-
-        # beta=0.02 ≈ 1.5 frames at max_v_l=75: keeps quadratic gradient in the 1–3 frame
-        # zone that separates R1@0.5 hits from R1@0.7 hits (was 0.05 ≈ 3.75 frames).
-        loss_bdy = F.smooth_l1_loss(src_xx, tgt_xx, reduction="mean", beta=0.02)
-        loss_iou = alpha_iou_temporal_loss(src_xx, tgt_xx, alpha=self.alpha_iou_alpha)
+        # ---- Deep-supervise iterative refinement passes (if available) ----
+        passes = outputs.get("pred_spans_refined_passes", None)
+        if isinstance(passes, (list, tuple)) and len(passes) > 0:
+            acc_boundary = 0.0
+            acc_giou     = 0.0
+            for p_cxw_full in passes:
+                p_cxw = p_cxw_full[idx]                       # (#matched, 2)
+                p_xx  = span_cxw_to_xx(p_cxw)
+                acc_boundary = acc_boundary + F.smooth_l1_loss(
+                    p_xx, tgt_xx, reduction="mean", beta=0.04)
+                acc_giou = acc_giou + alpha_iou_temporal_loss(
+                    p_xx, tgt_xx, alpha=self.alpha_iou_alpha)
+            loss_bdy = acc_boundary / len(passes)
+            loss_iou = acc_giou     / len(passes)
+        else:
+            # Fall back to single-pass computation on pred_spans_refined
+            src_cxw = outputs["pred_spans_refined"][idx]      # (#matched, 2)
+            src_xx  = span_cxw_to_xx(src_cxw)
+            # beta=0.04 ≈ 3 frames at max_v_l=75: keeps quadratic gradient in the
+            # 1–3 frame zone that separates R1@0.5 hits from R1@0.7 hits.
+            loss_bdy = F.smooth_l1_loss(src_xx, tgt_xx, reduction="mean", beta=0.04)
+            loss_iou = alpha_iou_temporal_loss(src_xx, tgt_xx, alpha=self.alpha_iou_alpha)
 
         return {"loss_boundary_refined": loss_bdy, "loss_giou_refined": loss_iou}
 
@@ -408,7 +442,7 @@ class VMRSetCriterion(nn.Module):
         """Compute the total weighted loss.
 
         Args:
-            outputs: dict from HLFormer_VMR.forward()
+            outputs: dict from GaussianFormer_VMR.forward()
             targets: dict from prepare_batch_inputs() - has span_labels, saliency_*
 
         Returns:
@@ -504,6 +538,9 @@ def build_criterion(cfg):
     # Boundary refinement losses (final decoder layer only — not propagated to aux layers)
     weight_dict["loss_boundary_refined"] = cfg.get("boundary_refine_coef",      0.0)
     weight_dict["loss_giou_refined"]     = cfg.get("boundary_refine_giou_coef", 0.0)
+    # Final-gate supervision: trains the refine_gate on pred_spans_final
+    weight_dict["loss_span_final"]       = cfg.get("final_loss_coef_span",      0.0)
+    weight_dict["loss_giou_final"]       = cfg.get("final_loss_coef_giou",      0.0)
 
     losses = ["spans", "labels", "saliency"]
     if cfg.get("use_contrastive", False):
@@ -513,7 +550,8 @@ def build_criterion(cfg):
     # Aux decoder layers: same loss keys as final layer (except saliency), scaled by
     # aux_loss_scale to prevent early layers from over-fitting to independent solutions.
     # Default scale=1.0 preserves original behaviour.
-    _final_only = {"loss_saliency", "loss_boundary_refined", "loss_giou_refined"}
+    _final_only = {"loss_saliency", "loss_boundary_refined", "loss_giou_refined",
+                   "loss_span_final", "loss_giou_final"}
     if cfg.get("aux_loss", False):
         n_aux      = cfg.get("dec_layers", 2) - 1
         _aux_scale = cfg.get("aux_loss_scale", 1.0)

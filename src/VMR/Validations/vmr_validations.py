@@ -37,12 +37,16 @@ def post_process_predictions(outputs, metas, duration_key="duration",
             "qid":         int
     """
     pred_logits = outputs["pred_logits"].detach().cpu()   # (B, Q)
-    # Prefer locally-refined boundary predictions when available (v15+).
-    # Falls back to coarse decoder output for older checkpoints.
+    # Use the gated coarse+refined blend for inference when available (pred_spans_final,
+    # added in change #4).  When use_refined_spans is True and pred_spans_refined exists,
+    # prefer that for backward compatibility with older checkpoints.
+    # For new checkpoints pred_spans_final is the canonical inference output.
     if use_refined_spans:
-        _raw = outputs.get("pred_spans_refined", outputs["pred_spans"])
+        _raw = outputs.get("pred_spans_final",
+               outputs.get("pred_spans_refined",
+               outputs["pred_spans"]))
     else:
-        _raw = outputs["pred_spans"]
+        _raw = outputs.get("pred_spans_final", outputs["pred_spans"])
     pred_spans  = _raw.detach().cpu()                     # (B, Q, 2) cxw [0,1]
 
     # Quality score: pred_logits is now (B, Q) — single logit per query slot.
@@ -310,7 +314,7 @@ def evaluate_vmr(model, dataloader, device, cfg):
     """Run full evaluation on a dataloader and return metrics.
 
     Args:
-        model:      HLFormer_VMR (eval mode)
+        model:      GaussianFormer_VMR (eval mode)
         dataloader: DataLoader returning (batch_meta, batched_data)
         device:     torch.device
         cfg:        config dict with iou_thresholds, nms_thresh, top_k

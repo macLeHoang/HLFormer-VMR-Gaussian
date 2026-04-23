@@ -1,5 +1,5 @@
 """
-Training entry point for HLFormer-VMR.
+Training entry point for GaussianFormer-VMR.
 
 Usage:
     cd ICCV25-HLFormer/src
@@ -88,7 +88,7 @@ class ModelEMA:
 # Argument parsing
 # ---------------------------------------------------------------------------
 
-parser = argparse.ArgumentParser(description="HLFormer-VMR Training")
+parser = argparse.ArgumentParser(description="GaussianFormer-VMR Training")
 parser.add_argument("-d", "--dataset_name", default="qvhighlights", type=str,
                     choices=["qvhighlights", "charades"],
                     help="Dataset to train on")
@@ -122,18 +122,51 @@ def set_all_seeds(seed):
 
 
 def build_optimizer(model, cfg):
-    """AdamW with optional separate learning rate for the video encoder."""
+    """AdamW with separate LRs for video encoder, boundary refinement head, and text encoder."""
     vid_enc_params  = list(model.video_encoder.parameters())
     vid_enc_ids     = set(id(p) for p in vid_enc_params)
+
+    refiner_params  = list(model.boundary_refine.parameters())
+    refiner_ids     = set(id(p) for p in refiner_params)
+
+    txt_enc         = getattr(model, "txt_encoder", None)
+    txt_enc_params  = []
+    txt_enc_ids     = set()
+    if txt_enc is not None:
+        txt_enc_params = list(txt_enc.parameters())
+        txt_enc_ids    = {id(p) for p in txt_enc_params}
+
     other_params    = [p for p in model.parameters()
-                       if id(p) not in vid_enc_ids and p.requires_grad]
+                       if id(p) not in vid_enc_ids
+                       and id(p) not in refiner_ids
+                       and id(p) not in txt_enc_ids
+                       and p.requires_grad]
     vid_params      = [p for p in vid_enc_params if p.requires_grad]
+    refiner_params  = [p for p in refiner_params if p.requires_grad]
+    txt_enc_params  = [p for p in txt_enc_params if p.requires_grad]
 
     param_groups = [
-        {"params": other_params,  "lr": cfg["lr"]},
-        {"params": vid_params,    "lr": cfg.get("lr_vid_enc", cfg["lr"])},
+        {"params": other_params,   "lr": cfg["lr"]},
+        {"params": vid_params,     "lr": cfg.get("lr_vid_enc", cfg["lr"])},
+        {"params": refiner_params, "lr": cfg.get("lr_refiner",  cfg["lr"])},
     ]
+    if txt_enc_params:
+        param_groups.append({
+            "params": txt_enc_params,
+            "lr":     cfg.get("lr_txt_enc", cfg["lr"]),
+        })
     optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg["wd"])
+    logger_ref = globals().get("logger")
+    if logger_ref is not None:
+        n_groups = len(param_groups)
+        logger_ref.info(
+            f"Optimizer: {n_groups} param groups — "
+            f"others lr={cfg['lr']:.2e}, "
+            f"vid_enc lr={cfg.get('lr_vid_enc', cfg['lr']):.2e}, "
+            f"refiner lr={cfg.get('lr_refiner', cfg['lr']):.2e}"
+            + (f", txt_enc lr={cfg.get('lr_txt_enc', cfg['lr']):.2e}"
+               if txt_enc_params else "")
+        )
     return optimizer
 
 
@@ -231,6 +264,8 @@ def apply_loss_schedule(epoch, criterion, cfg, logger=None):
         "boundary_loss_coef":         "loss_boundary",
         "boundary_refine_coef":       "loss_boundary_refined",
         "boundary_refine_giou_coef":  "loss_giou_refined",
+        "final_loss_coef_span":       "loss_span_final",
+        "final_loss_coef_giou":       "loss_giou_final",
         "contrastive_align_loss_coef":"loss_contrastive_align",
         "lw_saliency":                "loss_saliency",
         "label_loss_coef":            "loss_label",
@@ -261,6 +296,13 @@ def apply_loss_schedule(epoch, criterion, cfg, logger=None):
         criterion.matcher.cost_giou = current_phase["set_cost_giou"]
     if "set_cost_class" in current_phase:
         criterion.matcher.cost_class = current_phase["set_cost_class"]
+
+    # alpha_iou_alpha — ramp the α-IoU exponent on the criterion directly
+    if "alpha_iou_alpha" in current_phase:
+        new_alpha = float(current_phase["alpha_iou_alpha"])
+        setattr(criterion, "alpha_iou_alpha", new_alpha)
+        if logger:
+            logger.info(f"  [LossSchedule] alpha_iou_alpha -> {new_alpha}")
 
     # aux_loss_scale — re-scale all existing aux weight_dict entries to the new scale.
     # cfg is updated first so subsequent schedule phases inherit the correct value.
@@ -409,7 +451,7 @@ def main():
 
     # Logging
     logger = set_log(cfg["model_root"], "log_vmr.txt")
-    logger.info(f"HLFormer-VMR  dataset={cfg['dataset_name']}")
+    logger.info(f"GaussianFormer-VMR  dataset={cfg['dataset_name']}")
     logger.info(str(cfg))
 
     # Reproducibility

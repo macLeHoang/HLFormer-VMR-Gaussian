@@ -121,13 +121,11 @@ class LinearLayer(nn.Module):
         return x  # (N, L, D)
 
 
-class HLFormerBlock(nn.Module):
+class GaussianBlock(nn.Module):
     def __init__(self, config):
-        super(HLFormerBlock, self).__init__()
-
-        if config.attention_num % 2 != 0:
-            raise ValueError(f"attention_num must be even, got {config.attention_num}")
-        self.num_block = int(config.attention_num // 2) - 1
+        super(GaussianBlock, self).__init__()
+        
+        self.num_block = config.attention_num - 1
         self.e_attns = nn.ModuleList()
         self.e_attns.append(EuclideanAttentionBlock(config))
         for i in range(1, self.num_block + 1):
@@ -276,8 +274,10 @@ class EuclideanGaussianAttention(nn.Module):
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
         self.wid = wid
         self._gauss_cache = {}
-        _num_block = config.attention_num // 2 - 1
+        _num_block = config.attention_num - 1
         self.gauss_divisor = 2 ** (_num_block + 1) + 1
+        self.bias_mode = getattr(config, "gauss_bias_mode", "add_log")
+        self._log_gauss_cache = {}
 
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)  # (N, L, nh, dh)
@@ -300,6 +300,16 @@ class EuclideanGaussianAttention(nn.Module):
         gauss = gauss / gauss.max(dim=-1, keepdim=True)[0]
         self._gauss_cache[cache_key] = gauss
         return gauss
+
+    def generate_log_gauss_bias(self, props_len, width, device, dtype):
+        cache_key = (props_len, float(width), str(device), str(dtype))
+        if cache_key in self._log_gauss_cache:
+            return self._log_gauss_cache[cache_key]
+
+        gauss = self.generate_gauss_weight(props_len, width, device, dtype)
+        log_bias = torch.log(gauss.clamp_min(1e-6))
+        self._log_gauss_cache[cache_key] = log_bias
+        return log_bias
 
     def forward(self, query_states, key_states, value_states, attention_mask=None):
         """
@@ -324,12 +334,20 @@ class EuclideanGaussianAttention(nn.Module):
 
         attention_scores = attention_scores_ori
         if self.wid is not None:
-            gmm_mask = self.generate_gauss_weight(
-                attention_scores.shape[-1], self.wid,
-                device=attention_scores.device,
-                dtype=attention_scores.dtype,
-            ).unsqueeze(0).unsqueeze(0)
-            attention_scores = attention_scores_ori * gmm_mask
+            if self.bias_mode == "add_log":
+                log_bias = self.generate_log_gauss_bias(
+                    attention_scores.shape[-1], self.wid,
+                    device=attention_scores.device,
+                    dtype=attention_scores.dtype,
+                ).unsqueeze(0).unsqueeze(0)
+                attention_scores = attention_scores_ori + log_bias
+            else:
+                gmm_mask = self.generate_gauss_weight(
+                    attention_scores.shape[-1], self.wid,
+                    device=attention_scores.device,
+                    dtype=attention_scores.dtype,
+                ).unsqueeze(0).unsqueeze(0)
+                attention_scores = attention_scores_ori * gmm_mask
         # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
         if attention_mask is not None:
             attention_mask = (1 - attention_mask.unsqueeze(1)) * -10000.  # (N, 1, Lq, L)
