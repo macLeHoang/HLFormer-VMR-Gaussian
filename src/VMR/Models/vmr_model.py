@@ -783,9 +783,9 @@ class GaussianFormer_VMR(nn.Module):
         # activates as training progresses.
         nn.init.zeros_(self.caq_attn.out_proj.weight)
         nn.init.zeros_(self.caq_attn.out_proj.bias)
-        # Init refine_gate bias to -1.0 so sigmoid(0 * x + (-1)) ≈ 0.27 at ep0.
-        # Refinement contributes but doesn't dominate; gate grows as training progresses.
-        nn.init.constant_(self.refine_gate.bias, -1.0)
+        # Init refine_gate bias to 0.0 so sigmoid(0 * x + 0) = 0.5 at ep0.
+        # gate=0.5 init now safe with smaller max_delta (v5).
+        nn.init.constant_(self.refine_gate.bias, 0.0)   # v5: was -1.0; gate=0.5 init now safe with smaller max_delta
         # Spread decoder query reference points uniformly: cx in [0.1, 0.9], w = 0.3
         # sigmoid(query_embed.weight) is used as the initial reference point in _decode,
         # so we store inv_sigmoid of the desired initial values.

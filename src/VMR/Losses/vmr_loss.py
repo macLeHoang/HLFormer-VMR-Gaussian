@@ -124,7 +124,8 @@ class VMRSetCriterion(nn.Module):
                  saliency_margin=1.0, use_matcher=True,
                  temperature=0.07, label_smoothing=0.0,
                  alpha_iou_alpha=2.0,
-                 label_span_source="coarse"):
+                 label_span_source="coarse",
+                 iou_floor=0.1):
         super().__init__()
         self.matcher         = matcher
         self.weight_dict     = weight_dict
@@ -135,6 +136,7 @@ class VMRSetCriterion(nn.Module):
         self.label_smoothing = label_smoothing
         self.alpha_iou_alpha = alpha_iou_alpha   # exponent for Alpha-IoU in refiner head
         self.label_span_source = label_span_source
+        self.iou_floor = float(iou_floor)   # v5: parameterise quality-target floor
         assert self.label_span_source in {"coarse", "refined", "matched"}, \
             "label_span_source must be 'coarse', 'refined', or 'matched'"
 
@@ -283,7 +285,7 @@ class VMRSetCriterion(nn.Module):
             # weakened the quality-score gradient for the first ~15 epochs.
             # With floor=0.1 the separation is 0.1 vs 0.0 early on and naturally
             # grows toward 1.0 as IoU improves, giving a cleaner signal.
-            iou_scores = raw_iou.clamp(min=0.1)                            # (#matched,) in [0.1, 1.0]
+            iou_scores = raw_iou.clamp(min=self.iou_floor)                    # (#matched,) in [iou_floor, 1.0]
 
         # Soft targets: matched -> IoU score, unmatched -> 0.0
         soft_targets = torch.zeros_like(fg_logits)   # (B, Q)
@@ -574,5 +576,6 @@ def build_criterion(cfg):
         label_smoothing= cfg.get("label_smoothing", 0.0),
         alpha_iou_alpha= cfg.get("alpha_iou_alpha", 2.0),
         label_span_source=cfg.get("label_span_source", "coarse"),
+        iou_floor      = cfg.get("iou_floor", 0.1),
     )
     return criterion
