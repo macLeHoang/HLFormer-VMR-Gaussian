@@ -477,7 +477,7 @@ class BoundaryRefinementHead(nn.Module):
         end   = (pred_spans[..., 0] + pred_spans[..., 1] / 2).clamp(0., 1.)  # (B, Q)
 
         # Pre-compute fixed quantities shared across passes.
-        t_pos   = torch.linspace(0., 1., L, device=dev)         # (L,)
+        t_pos   = (torch.arange(L, device=dev, dtype=vid_feat.dtype) + 0.5) / L  # (L,)
         min_sig = 1.0 / (4.0 * L)                               # floor: 0.25 frames
 
         if txt_rep is not None:

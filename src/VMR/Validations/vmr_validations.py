@@ -336,6 +336,7 @@ def evaluate_vmr(model, dataloader, device, cfg):
     all_saliency_scores = []
     all_saliency_labels = []
     all_vid_masks       = []
+    all_gate_means      = []
 
     for batch_meta, batched_data in dataloader:
         model_inputs, targets = prepare_batch_inputs(batched_data, device)
@@ -348,6 +349,9 @@ def evaluate_vmr(model, dataloader, device, cfg):
 
         all_preds.extend(preds)
         all_gt.extend(gts)
+
+        if "pred_refine_gate" in outputs:
+            all_gate_means.append(outputs["pred_refine_gate"].mean().item())
 
         if "saliency_all_labels" in batched_data:
             all_saliency_scores.append(outputs["saliency_scores"].cpu())
@@ -388,5 +392,12 @@ def evaluate_vmr(model, dataloader, device, cfg):
     map_05 = metrics.get("mAP@0.5", 0.0)
     map_07 = metrics.get("mAP@0.7", 0.0)
     metrics["primary"] = 0.5 * (r1_05 + r1_07) + 0.25 * (map_05 + map_07)
+
+    if all_gate_means:
+        metrics["refine_gate_mean"] = sum(all_gate_means) / len(all_gate_means)
+
+    if hasattr(model.input_vid_proj, "stream_logits"):
+        alpha = torch.softmax(model.input_vid_proj.stream_logits, dim=0).tolist()
+        metrics["stream_weights"] = [round(a, 3) for a in alpha]
 
     return metrics

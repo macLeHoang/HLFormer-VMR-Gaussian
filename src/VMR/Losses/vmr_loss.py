@@ -137,8 +137,8 @@ class VMRSetCriterion(nn.Module):
         self.alpha_iou_alpha = alpha_iou_alpha   # exponent for Alpha-IoU in refiner head
         self.label_span_source = label_span_source
         self.iou_floor = float(iou_floor)   # v5: parameterise quality-target floor
-        assert self.label_span_source in {"coarse", "refined", "matched"}, \
-            "label_span_source must be 'coarse', 'refined', or 'matched'"
+        assert self.label_span_source in {"coarse", "refined", "matched", "final"}, \
+            "label_span_source must be 'coarse', 'refined', 'matched', or 'final'"
 
         # Class weights: foreground=1.0, background=eos_coef
         empty_weight = torch.ones(2)
@@ -261,16 +261,18 @@ class VMRSetCriterion(nn.Module):
 
         # Compute actual IoU for each matched (pred, gt) pair — no gradient
         with torch.no_grad():
-            use_refined_for_labels = False
-            if self.label_span_source == "refined":
-                use_refined_for_labels = True
+            if outputs.get("pred_spans_final") is not None and self.label_span_source == "final":
+                span_key = "pred_spans_final"
+            elif self.label_span_source == "refined" and outputs.get("pred_spans_refined") is not None:
+                span_key = "pred_spans_refined"
             elif self.label_span_source == "matched":
                 matcher_source = getattr(self.matcher, "match_span_source", "coarse")
-                use_refined_for_labels = matcher_source in {"refined", "dual"}
-
-            span_key = "pred_spans_refined" if (
-                use_refined_for_labels and outputs.get("pred_spans_refined") is not None
-            ) else "pred_spans"
+                if matcher_source in {"refined", "dual"} and outputs.get("pred_spans_refined") is not None:
+                    span_key = "pred_spans_refined"
+                else:
+                    span_key = "pred_spans"
+            else:
+                span_key = "pred_spans_refined" if outputs.get("pred_spans_refined") is not None and self.label_span_source == "final" else "pred_spans"
 
             src_spans = span_cxw_to_xx(outputs[span_key][idx])            # (#matched, 2)
             tgt_spans = span_cxw_to_xx(

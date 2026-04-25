@@ -304,6 +304,13 @@ def apply_loss_schedule(epoch, criterion, cfg, logger=None):
         if logger:
             logger.info(f"  [LossSchedule] alpha_iou_alpha -> {new_alpha}")
 
+    if "iou_floor" in current_phase:
+        new_iou_floor = float(current_phase["iou_floor"])
+        setattr(criterion, "iou_floor", new_iou_floor)
+        cfg["iou_floor"] = new_iou_floor
+        if logger:
+            logger.info(f"  [LossSchedule] iou_floor -> {new_iou_floor}")
+
     # aux_loss_scale — re-scale all existing aux weight_dict entries to the new scale.
     # cfg is updated first so subsequent schedule phases inherit the correct value.
     if "aux_loss_scale" in current_phase:
@@ -432,10 +439,10 @@ def log_metrics(logger, epoch, train_loss, metrics, best_metrics, avg_components
             logger.info(f"    {k}: {v:.4f}")
     if metrics:
         for k, v in metrics.items():
-            logger.info(f"  {k}: {v:.2f}")
+            logger.info(f"  {k}: {v:.2f}" if isinstance(v, (int, float)) else f"  {k}: {v}")
         logger.info("  Best so far:")
         for k, v in best_metrics.items():
-            logger.info(f"    {k}: {v:.2f}")
+            logger.info(f"    {k}: {v:.2f}" if isinstance(v, (int, float)) else f"    {k}: {v}")
     logger.info("=" * 80)
 
 
@@ -463,6 +470,12 @@ def main():
     train_loader, val_loader, test_loader = build_vmr_dataloaders(cfg)
     logger.info(f"Train: {len(train_loader.dataset)} samples  "
                 f"Val: {len(val_loader.dataset)} samples")
+
+    for split_name, loader in (("train", train_loader), ("val", val_loader)):
+        dset = getattr(loader, "dataset", None)
+        if dset is not None and hasattr(dset, "summarize_temporal_alignment"):
+            summary = dset.summarize_temporal_alignment()
+            logger.info(f"{split_name.title()} temporal alignment: {summary}")
 
     # ---------- Model ---------------------------------------------------------
     logger.info("Building model ...")

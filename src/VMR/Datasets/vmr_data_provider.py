@@ -23,6 +23,7 @@ import json
 import random
 import logging
 from os.path import join, exists
+from statistics import mean
 
 import numpy as np
 import scipy.ndimage
@@ -290,17 +291,81 @@ class VMRDataset(Dataset):
                 feat = l2_normalize_np_array(feat)
             feat_list.append(feat)
 
+        target_len = self._aligned_video_length_from_lengths([len(f) for f in feat_list])
         if self.v_feat_len_mode == "max":
             # Resample shorter sources up to the longest (no data discarded)
-            target_len = max(len(f) for f in feat_list)
             feat_list = [resample_feat(f, target_len) for f in feat_list]
         else:  # "min"
             # Truncate to the shortest (no interpolation artefacts)
-            target_len = min(len(f) for f in feat_list)
             feat_list = [f[:target_len] for f in feat_list]
 
         feat = np.concatenate(feat_list, axis=1)
         return torch.from_numpy(feat)   # (target_len, D_v)
+
+    def _aligned_video_length_from_lengths(self, lengths):
+        if not lengths:
+            return 0
+        return max(lengths) if self.v_feat_len_mode == "max" else min(lengths)
+
+    def summarize_temporal_alignment(self, max_samples=None):
+        samples = self.data if max_samples is None else self.data[:max_samples]
+        if not samples:
+            return {"samples": 0}
+
+        raw_lengths_per_stream = [[] for _ in self.v_feat_dirs]
+        final_ctx_lengths = []
+        durations = []
+        implied_durations = []
+        mismatch_count = 0
+        clamp_count = 0
+        load_failures = 0
+
+        for meta in samples:
+            try:
+                stream_lengths = []
+                for stream_idx, feat_dir in enumerate(self.v_feat_dirs):
+                    path = join(feat_dir, f"{meta['vid']}.npz")
+                    feat = np.load(path)["features"]
+                    raw_len = int(min(len(feat), self.max_v_l))
+                    raw_lengths_per_stream[stream_idx].append(raw_len)
+                    stream_lengths.append(raw_len)
+
+                ctx_l = self._aligned_video_length_from_lengths(stream_lengths)
+                duration = float(meta.get("duration", 0.0))
+                implied_duration = float(ctx_l * self.clip_len)
+
+                final_ctx_lengths.append(ctx_l)
+                durations.append(duration)
+                implied_durations.append(implied_duration)
+
+                if abs(duration - implied_duration) > 1e-3:
+                    mismatch_count += 1
+
+                if self.load_labels:
+                    total_len = max(duration, 1e-6)
+                    windows = torch.tensor(meta.get("relevant_windows", []), dtype=torch.float32)
+                    if windows.numel() > 0:
+                        windows_norm_raw = windows / total_len
+                        windows_norm = windows_norm_raw.clamp(0.0, 1.0)
+                        if not torch.equal(windows_norm, windows_norm_raw):
+                            clamp_count += 1
+            except Exception:
+                load_failures += 1
+
+        summary = {
+            "samples": len(samples),
+            "load_failures": load_failures,
+            "mismatch_count": mismatch_count,
+            "mismatch_ratio": mismatch_count / max(len(samples), 1),
+            "span_clamp_count": clamp_count,
+            "span_clamp_ratio": clamp_count / max(len(samples), 1),
+            "ctx_l_mean": mean(final_ctx_lengths) if final_ctx_lengths else 0.0,
+            "duration_mean": mean(durations) if durations else 0.0,
+            "implied_duration_mean": mean(implied_durations) if implied_durations else 0.0,
+        }
+        for i, vals in enumerate(raw_lengths_per_stream):
+            summary[f"stream{i}_raw_len_mean"] = mean(vals) if vals else 0.0
+        return summary
 
     def _random_drop_rows(self, feat):
         n_drop = round(len(feat) * self.txt_drop_ratio)
@@ -386,7 +451,7 @@ class VMRDataset(Dataset):
             random.shuffle(windows)
             windows = windows[:self.max_windows]
 
-        total_len = ctx_l * self.clip_len          # total covered time
+        total_len = max(float(duration), 1e-6)
         windows_t = torch.tensor(windows, dtype=torch.float32)
         windows_norm = windows_t / total_len        # normalize to [0, 1]
         windows_norm = windows_norm.clamp(0.0, 1.0)

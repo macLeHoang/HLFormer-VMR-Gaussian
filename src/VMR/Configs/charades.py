@@ -15,7 +15,7 @@ cfg = dict(_qvh.cfg)   # inherit defaults, then override
 
 cfg["seed"]          = 36
 
-cfg["model_name"]    = "GaussianFormer_VMR_v5"
+cfg["model_name"]    = "GaussianFormer_VMR_v9"
 cfg["dataset_name"]  = "charades_sta"
 cfg["dset_name"]     = "charades_sta"
 
@@ -56,7 +56,7 @@ cfg["dec_layers"]     = 3
 cfg["input_drop"]     = 0.3
 cfg["drop"]           = 0.2
 cfg["txt_drop_ratio"] = 0.1
-cfg["t2v_layers"]     = 3  # deepened 3->4 to unblock cross-modal fusion
+cfg["t2v_layers"]     = 3  
 cfg["attention_num"]  = 5
 cfg["pos_enc_type"]   = "trainable"
 cfg["sft_factor"]     = 0.3   # v11=0.06; stronger query-conditioned feature shift
@@ -76,7 +76,7 @@ cfg["use_refined_spans"] = True  # boundary refiner now active; refined spans us
 # at evaluation time (refined when available), with safe fallback to coarse.
 cfg["match_span_source"]   = "coarse"   # remediation: "refined"→"coarse"; prevents matcher churn when refiner is cold early
 cfg["refined_cost_weight"] = 0.0         # ignored under "coarse"; set to 0 for clarity
-cfg["label_span_source"]   = "matched"   # coarse | refined | matched
+cfg["label_span_source"]   = "final"   # coarse | refined | matched | final
 
 # ---- Contrastive alignment -----------------------------------------------
 # temperature=0.07: MoCo-style sharp negatives; v11=0.3 was too smooth → loss never converged
@@ -105,34 +105,34 @@ cfg["boundary_loss_coef"] = 0.0   # disabled: smooth-L1 on (start,end) is redund
                                    # Boundary supervision is kept in the refinement head.
 cfg["label_loss_coef"]    = 1.5   # remediation: 2.5→1.5; further reduce quality-head dominance to let span losses breathe
 # cfg["label_smoothing"]    = 0.1  # v32: 0.1→0.2; softer targets reduce overconfident predictions
-cfg["final_loss_coef_span"] = 0.5  # boundary refiner enabled; cold-start weight, ramped via loss_schedule
-cfg["final_loss_coef_giou"] = 0.25  # boundary refiner enabled; cold-start weight, ramped via loss_schedule
+cfg["final_loss_coef_span"] = 1.0  # v7: rollback 2.0→1.0
+cfg["final_loss_coef_giou"] = 0.75  # v7: rollback 1.5→0.75
 
 # ---- Boundary refinement losses (BoundaryRefinementHead, v15) -----------
 # Applied to pred_spans_refined (final layer only, same Hungarian indices).
 # Refiner is auxiliary: constant low coef keeps it contributing without
 # overwhelming the coarse decoder.  Head gradient unblocked by removing
 # zero-init on joint_mlp final layer (vmr_model.py) and raising lr_refiner.
-cfg["boundary_refine_coef"]           = 0.5   # remediation: 0.0→0.5; refiner enabled at cold-start auxiliary weight
-cfg["boundary_refine_giou_coef"]      = 0.25  # remediation: 0.0→0.25; refiner enabled at cold-start auxiliary weight
-cfg["boundary_refine_window"]         = 12     # v34: at max_v_l=77, sigma=16/154≈0.10 (10% of video); tight enough for precise boundary pooling
+cfg["boundary_refine_coef"]           = 1.0   # v7: rollback 1.5→1.0
+cfg["boundary_refine_giou_coef"]      = 0.5   # v7: rollback 1.0→0.5
+cfg["boundary_refine_window"]         = 12     # v7: rollback 10→12
 cfg["boundary_refine_learnable_sigma"] = True
-cfg["boundary_refine_max_delta"]      = 0.06  # v5: tighter — refiner was overshooting on Charades
-cfg["iou_floor"] = 0.0   # v5: unfloor matched-IoU quality targets (was hardcoded 0.1)
-cfg["refine_num_passes"]              = 2      # v5: second pass once deltas are small
+cfg["boundary_refine_max_delta"]      = 0.07  # v7: rollback 0.10→0.07
+cfg["iou_floor"] = 0.2   # v6: 0.0→0.2; matched slots always have target ≥ 0.2, fixes label-head cold start
+cfg["refine_num_passes"]              = 2      # v7: rollback 3→2
 cfg["alpha_iou_alpha"]                = 2.0   # static; no ramp
 
 # aux_loss_scale starts low: early decoder layers produce near-zero IoU targets,
 # creating a strong "everything is background" pull if aux losses are weighted heavily.
 # Ramped via loss_schedule once coarse localization stabilises.
-cfg["aux_loss_scale"]     = 0.4   # v5: matches Phase 0 of loss_schedule
+cfg["aux_loss_scale"]     = 0.2   # v6: matches Phase 0 of loss_schedule
 
 # ---- Hungarian matcher ---------------------------------------------------
-# v31: set_cost_class and set_cost_giou raised from 1.0 to 2.0 from start
-# to stabilize matching early (quality predictions are good enough by ep3-5).
-cfg["set_cost_class"]  = 1.0   # remediation: 3.0→1.0; weak matcher at cold start, ramped via loss_schedule
-cfg["set_cost_span"]   = 3.0   # remediation: 5.0→3.0; Phase 0 static value, matches loss_schedule entry
-cfg["set_cost_giou"]   = 2.0   # remediation: 4.0→2.0; Phase 0 static value, matches loss_schedule entry
+# v6: set_cost_* frozen at Phase 0 static values; no three-way ramp.
+# Phase 1 (ep5) raises costs to (2,4,3); no Phase 2 jump (removes matcher churn).
+cfg["set_cost_class"]  = 1.0   # v6: Phase 0 static; matches loss_schedule Phase 0
+cfg["set_cost_span"]   = 3.0   # v6: Phase 0 static; matches loss_schedule Phase 0
+cfg["set_cost_giou"]   = 2.0   # v6: Phase 0 static; matches loss_schedule Phase 0
 
 # ---- Post-processing -----------------------------------------------------
 cfg["top_k"]      = 8  # remediation: 10→8; aligned to num_queries=8 to avoid empty candidate slots
@@ -145,75 +145,65 @@ cfg["lr_refiner"]    = 1.5e-4    # 3x base lr; pushes boundary_refine head out o
 cfg["lr_txt_enc"]    = 0.75e-4    # learning rate for text encoder
 cfg["lr_drop"]       = 30     # kept for backward compat; unused when cosine_T0 > 0
 cfg["lr_gamma"]      = 0.5    # kept for backward compat
-cfg["warmup_epochs"] = 5
-cfg["cosine_T0"]     = 35
+cfg["warmup_epochs"] = 3      # v6: 5→3
+cfg["cosine_T0"]     = 50     # v6: 35→50; single full cycle over the 50-epoch budget
 cfg["cosine_Tmult"]  = 1      # no second cycle in 50-epoch budget
-cfg["cosine_eta_min_ratio"] = 0.01  # v32: NEW; min LR = 1% of base at cycle trough
+cfg["cosine_eta_min_ratio"] = 0.005  # v6: 0.01→0.005; deeper trough for final fine-tune
 cfg["wd"]            = 5e-5   # remediation: 1e-4→5e-5; slight relaxation to avoid over-regularising refiner head
 cfg["grad_clip"]     = 0.3
 
 # ---- EMA ----------------------------------------------------------------
 cfg["use_ema"]       = True   # v32: NEW; exponential moving average smooths val fluctuations (+1-2 R1)
 cfg["ema_decay"]     = 0.999
-cfg["n_epoch"]       = 70
-cfg["max_es_cnt"]    = 25     # remediation: 15→25; allow more patience for refiner and ramp phases to mature
+cfg["n_epoch"]       = 50     # v6: 70→50
+cfg["max_es_cnt"]    = 12     # v6: 25→12; stop 12 epochs after peak
 cfg["batchsize"]     = 32
 
 # ---- DataLoader ----------------------------------------------------------
 cfg["num_workers"] = 2
 
 # ---- Data augmentation (training only) -----------------------------------
-cfg["temporal_crop_ratio"] = 0.25   # v32: randomly crop 20% of video, forces context-invariant localization
-cfg["feat_mask_ratio"]     = 0.25  # v32: randomly mask 15% of clips, prevents reliance on specific frames
-cfg["gt_jitter_frames"]    = 2  # v32: jitter GT boundaries ±2 frames, smooths supervision signal
-cfg["feat_noise_std"]      = 0.0  # v32: Gaussian noise σ added to projected features during training
+cfg["temporal_crop_ratio"] = 0.20   # v6: kept strong (was 0.25); matches aug_schedule Phase 0
+cfg["feat_mask_ratio"]     = 0.15   # v6: kept strong (was 0.25); matches aug_schedule Phase 0
+cfg["gt_jitter_frames"]    = 2      # v6: unchanged; matches aug_schedule Phase 0
+cfg["feat_noise_std"]      = 0.01   # v6: 0.0→0.01; gentle projection-layer regularisation
 
 # Epoch-wise augmentation schedule (train only).
 # Each entry updates train_dset augmentation strengths from `from_epoch` onward.
+# v6: three phases — stronger augmentation kept until ep35 to prevent ep35 overfitting cliff.
 cfg["aug_schedule"] = [
-    (0, {
-        "temporal_crop_ratio": 0.2,
-        "feat_mask_ratio":     0.15,
-        "gt_jitter_frames":    2,
-    }),
-    (35, {
-        "temporal_crop_ratio": 0.05,
-        "feat_mask_ratio":     0.05,
-        "gt_jitter_frames":    1,
-    }),
+    (0,  {"temporal_crop_ratio": 0.20, "feat_mask_ratio": 0.15, "gt_jitter_frames": 2}),
+    (20, {"temporal_crop_ratio": 0.15, "feat_mask_ratio": 0.15, "gt_jitter_frames": 2}),
 ]
 
 cfg["iou_thresholds"] = [0.3, 0.5, 0.7]
 
 # ---- Validation schedule -------------------------------------------------
 cfg["val_freq"]       = 3     # validate every 3 epochs before val_full_epoch
-cfg["val_full_epoch"] = 12   # dense validation from near prior best (ep15)
+cfg["val_full_epoch"] = 10   # v6: 12→10; dense validation earlier in a 50-epoch budget
 
 # ---- Loss schedule -------------------------------------------------------
 # Each entry: (from_epoch, {cfg_key: new_value, ...})
 # apply_loss_schedule() in main_vmr.py reads this and patches criterion.weight_dict
 # and matcher costs at phase boundaries.
 #
-# Five phases: cold start → matcher stabilises → refiner hot → cool contrastive → late IoU fine-tune.
+# Three phases: cold start → matcher stabilises → late IoU fine-tune.
+# ep15 matcher-cost jump REMOVED (was (3,5,4)) — no matcher churn.
+# ep35 contrastive cooldown REMOVED — contrastive stays active throughout.
 # Static cfg values above must match Phase 0 so build_criterion() starts correctly.
 cfg["loss_schedule"] = [
-    # Phase 0 (ep 0-4): cold start — weak matcher, refiner active but auxiliary
+    # Phase 0 (ep 0-4): cold start — refiner hot from start
     (0,  {'span_loss_coef': 10.0, 'giou_loss_coef': 6.0,
-          'boundary_refine_coef': 0.5, 'boundary_refine_giou_coef': 0.25,
-          'final_loss_coef_span': 0.5, 'final_loss_coef_giou': 0.25,
+          'boundary_refine_coef': 1.0, 'boundary_refine_giou_coef': 0.5,
+          'final_loss_coef_span': 1.0, 'final_loss_coef_giou': 0.75,
           'contrastive_align_loss_coef': 0.03, 'aux_loss_scale': 0.2,
           'set_cost_class': 1.0, 'set_cost_span': 3.0, 'set_cost_giou': 2.0,
-          'alpha_iou_alpha': 2.0}),
-    # Phase 1 (ep 5-14): matcher stabilises
-    (5,  {'set_cost_class': 2.0, 'set_cost_span': 4.0, 'set_cost_giou': 3.0}),
-    # Phase 2 (ep 15-34): full matcher, ramp refiner + final-span supervision
-    (15, {'set_cost_class': 3.0, 'set_cost_span': 5.0, 'set_cost_giou': 4.0,
-          'final_loss_coef_span': 1.0, 'final_loss_coef_giou': 0.5,
-          'boundary_refine_coef': 1.0, 'boundary_refine_giou_coef': 0.5}),
-    # Phase 3 (ep 35-49): cool contrastive; keep span coef high
-    (35, {'contrastive_align_loss_coef': 0.02, 'span_loss_coef': 8.0}),
-    # Phase 4 (ep 50+): late IoU-focused fine-tune
-    (50, {'giou_loss_coef': 8.0, 'label_loss_coef': 1.0}),
+          'alpha_iou_alpha': 2.0, 'iou_floor': 0.2}),
+    # Phase 1 (ep 5-11): matcher stabilises
+    (5,  {'set_cost_class': 2.0, 'set_cost_span': 4.0, 'set_cost_giou': 3.0,
+          'aux_loss_scale': 0.4}),
+    # Phase 2 (ep 12+): reduce quality-target floor once coarse localisation is stable
+    (12, {'iou_floor': 0.05}),
 ]
 
 
