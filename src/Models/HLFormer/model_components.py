@@ -129,7 +129,7 @@ class GaussianBlock(nn.Module):
         self.e_attns = nn.ModuleList()
         self.e_attns.append(EuclideanAttentionBlock(config))
         for i in range(1, self.num_block + 1):
-            wid = 2 ** (i + 1)
+            wid = 2 ** (i)
             self.e_attns.append(EuclideanAttentionBlock(config, wid=wid))
 
         self.ca = CrossAttention(config)
@@ -275,7 +275,7 @@ class EuclideanGaussianAttention(nn.Module):
         self.wid = wid
         self._gauss_cache = {}
         _num_block = config.attention_num - 1
-        self.gauss_divisor = 2 ** (_num_block + 1) + 1
+        self.gauss_divisor = 2 ** (_num_block) + 1
         self.bias_mode = getattr(config, "gauss_bias_mode", "add_log")
         self._log_gauss_cache = {}
 

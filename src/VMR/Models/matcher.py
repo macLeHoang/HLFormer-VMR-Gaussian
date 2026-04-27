@@ -47,7 +47,7 @@ class HungarianMatcher(nn.Module):
         Args:
             outputs: dict with keys
                 "pred_spans":  (B, num_queries, 2)  – (center, width) normalized
-                "pred_logits": (B, num_queries)    – quality logit (single value per query)
+                "pred_logits": (B, num_queries)    – quality/ranking logit (single value per query)
             targets: dict with key
                 "span_labels": list of B dicts, each {"spans": (num_gt, 2)}
 
@@ -57,8 +57,9 @@ class HungarianMatcher(nn.Module):
         bs, num_queries = outputs["pred_spans"].shape[:2]
         tgt_list = targets["span_labels"]
 
-        # Use sigmoid of the quality logit — pred_logits is now (B, Q) after
-        # class_head was changed to Linear(H, 1).
+        # Use sigmoid of the per-query quality/ranking logit. This score is used
+        # for relative matching preference; weighted BCE in the criterion does not
+        # guarantee that it is a calibrated probability or unbiased IoU estimate.
         out_quality = outputs["pred_logits"].flatten(0, 1).sigmoid()            # (B*Q,)
         coarse_spans = outputs["pred_spans"].flatten(0, 1)                      # (B*Q, 2)
         refined_spans = outputs.get("pred_spans_refined", None)

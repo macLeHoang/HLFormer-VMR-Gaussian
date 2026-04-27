@@ -123,13 +123,16 @@ def set_all_seeds(seed):
 
 def build_optimizer(model, cfg):
     """AdamW with separate LRs for video encoder, boundary refinement head, and text encoder."""
-    vid_enc_params  = list(model.video_encoder.parameters())
+    raw_model = model.module if isinstance(model, nn.DataParallel) else model
+
+    vid_enc_params  = list(raw_model.video_encoder.parameters())
     vid_enc_ids     = set(id(p) for p in vid_enc_params)
 
-    refiner_params  = list(model.boundary_refine.parameters())
+    refiner_module  = getattr(raw_model, "boundary_refine", None)
+    refiner_params  = list(refiner_module.parameters()) if refiner_module is not None else []
     refiner_ids     = set(id(p) for p in refiner_params)
 
-    txt_enc         = getattr(model, "txt_encoder", None)
+    txt_enc         = getattr(raw_model, "txt_encoder", None)
     txt_enc_params  = []
     txt_enc_ids     = set()
     if txt_enc is not None:
@@ -271,9 +274,19 @@ def apply_loss_schedule(epoch, criterion, cfg, logger=None):
         "label_loss_coef":            "loss_label",
     }
 
+    refinement_schedule_keys = {
+        "boundary_refine_coef",
+        "boundary_refine_giou_coef",
+        "final_loss_coef_span",
+        "final_loss_coef_giou",
+    }
+    use_boundary_refinement = cfg.get("use_boundary_refinement", True)
+
     for cfg_key, new_val in current_phase.items():
         if cfg_key in ("set_cost_span", "set_cost_giou", "set_cost_class"):
             continue  # handled below
+        if not use_boundary_refinement and cfg_key in refinement_schedule_keys:
+            continue
 
         wk = key_map.get(cfg_key)
         if wk is None:
@@ -489,6 +502,12 @@ def main():
 
     # ---------- Loss ----------------------------------------------------------
     criterion = build_criterion(cfg).to(device)
+    logger.info(
+        "Span semantics: matcher=%s label=%s eval=%s",
+        cfg.get("match_span_source", "coarse"),
+        cfg.get("label_span_source", "coarse"),
+        "final->refined->coarse" if cfg.get("use_refined_spans", True) else "coarse-only",
+    )
 
     # ---------- Checkpoint resume ---------------------------------------------
     current_epoch      = -1
@@ -507,9 +526,15 @@ def main():
             logger.info(f"  Missing keys (will use init): {_info.missing_keys}")
         if _info.unexpected_keys:
             logger.info(f"  Unexpected keys (ignored): {_info.unexpected_keys}")
-        optimizer.load_state_dict(opt_state)
+        try:
+            optimizer.load_state_dict(opt_state)
+        except ValueError as exc:
+            logger.info(f"  Optimizer state restore skipped: {exc}")
         if sched_state is not None:
-            scheduler.load_state_dict(sched_state)
+            try:
+                scheduler.load_state_dict(sched_state)
+            except ValueError as exc:
+                logger.info(f"  Scheduler state restore skipped: {exc}")
         best_metrics = saved_metrics if isinstance(saved_metrics, dict) \
                        else {"primary": saved_metrics}
         # Stash EMA weights if present (last.pt stores them under "ema_state_dict")

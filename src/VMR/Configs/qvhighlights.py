@@ -72,9 +72,15 @@ cfg["attention_num"]  = 8    # total attention branches (all Euclidean Gaussian)
 cfg["t2v_layers"]     = 6    # number of stacked T2VEncoderLayer blocks
 
 # Auxiliary decoder losses (losses from each intermediate decoder layer)
-cfg["aux_loss"]              = True
-cfg["use_txt_in_memory"]     = True   # True=[video|text] in decoder, False=video only (QD-DETR style)
-cfg["use_global_in_encoder"] = False  # True=global token passes through GaussianBlock (QD-DETR style)
+cfg["aux_loss"]                 = True
+cfg["use_txt_in_memory"]            = True   # True=[video|text] in decoder, False=video only (QD-DETR style)
+cfg["use_mem_kv_for_txt_memory"]    = False  # True=refine decoder text memory via residual cross-attn over [global|video]
+cfg["use_global_in_encoder"]        = False  # True=global token passes through GaussianBlock (QD-DETR style)
+cfg["use_boundary_refinement"]      = True   # controls whether BoundaryRefinementHead runs; eval span choice still uses use_refined_spans
+cfg["use_refined_spans"]        = True   # inference prefers pred_spans_final, then pred_spans_refined, then pred_spans
+cfg["match_span_source"]        = "coarse"   # matcher cost uses coarse spans unless a config explicitly opts into refined/dual
+cfg["label_span_source"]        = "coarse"   # quality targets use coarse spans by default; 'matched' proxies matcher intent
+cfg["iou_floor"]                = 0.1        # minimum IoU target assigned to matched slots
 
 # ---- Loss weights --------------------------------------------------------
 cfg["span_loss_coef"]   = 10.0

@@ -2,9 +2,10 @@
 Loss criterion for Video Moment Retrieval.
 
 Contains four loss components (all from QD-DETR):
-  1. loss_span   – L1 + GIoU regression on matched span pairs
-  2. loss_label  – foreground / background cross-entropy
-  3. loss_saliency – ranking contrastive loss + negative-pair loss + margin loss
+  1. loss_span      – span regression on matched pairs
+  2. loss_label     – weighted BCE on a single quality logit with soft IoU targets
+  3. loss_saliency  – ranking contrastive loss + negative-pair loss + margin loss
+  4. loss_contrastive_align – query/text alignment loss when enabled
 
 Adapted from QD-DETR (https://github.com/wjun0830/QD-DETR).
 """
@@ -102,14 +103,14 @@ class VMRSetCriterion(nn.Module):
 
     Process:
         1. Run the Hungarian matcher to assign predictions to GT spans.
-        2. Compute span L1 + GIoU losses on matched pairs.
-        3. Compute foreground/background classification loss.
+        2. Compute span regression losses on matched pairs.
+        3. Train a single per-query quality logit with soft IoU targets.
         4. Compute saliency loss (ranking contrastive + margin + neg-pair).
 
     Args:
         matcher:          HungarianMatcher instance
         weight_dict:      {loss_name: weight} for final weighted sum
-        eos_coef:         class weight for the background (non-object) class
+        eos_coef:         retained for compatibility with the original criterion API
         losses:           list of active loss names, e.g. ["spans","labels","saliency"]
         saliency_margin:  margin for the margin-based saliency ranking loss
         use_matcher:      if False, skip matching and only compute saliency loss
@@ -150,13 +151,25 @@ class VMRSetCriterion(nn.Module):
     # ------------------------------------------------------------------
 
     def loss_spans(self, outputs, targets, indices):
-        """L1 regression loss + DIoU loss on matched (prediction, GT) pairs.
+        """L1 regression + DIoU/Alpha-IoU losses on matched span pairs.
 
-        Both are in normalized (center, width) format in [0, 1].
-        DIoU replaces GIoU: provides direct center-alignment gradient even when
-        spans do not overlap, which is common in early training epochs.
+        Both prediction and target spans are in normalized (center, width)
+        format in [0, 1]. If a batch contains no matches, return finite zero
+        losses so the weighted sum remains well-defined.
         """
         assert "pred_spans" in outputs
+        zero = self._zero_loss(outputs)
+        losses = {
+            "loss_span": zero,
+            "loss_giou": zero,
+            "loss_boundary": zero,
+        }
+        if outputs.get("pred_spans_final") is not None:
+            losses["loss_span_final"] = zero
+            losses["loss_giou_final"] = zero
+        if not self._has_matches(indices):
+            return losses
+
         idx      = self._src_permutation_idx(indices)
         src_cxw  = outputs["pred_spans"][idx]                                 # (#matched, 2)
         tgt_cxw  = torch.cat(
@@ -182,10 +195,12 @@ class VMRSetCriterion(nn.Module):
         # maximise signal in the 0.5→0.7 IoU transition region (R1@0.7 bottleneck).
         loss_giou_combined = 0.3 * loss_diou + 0.7 * loss_alpha
 
-        losses = {"loss_span": loss_l1, "loss_giou": loss_giou_combined, "loss_boundary": loss_boundary}
+        losses["loss_span"] = loss_l1
+        losses["loss_giou"] = loss_giou_combined
+        losses["loss_boundary"] = loss_boundary
 
         # ---- Supervision on pred_spans_final (trains the refine_gate) ----
-        if "pred_spans_final" in outputs and outputs["pred_spans_final"] is not None:
+        if outputs.get("pred_spans_final") is not None:
             src_cxw_f = outputs["pred_spans_final"][idx]              # (#matched, 2)
             src_xx_f  = span_cxw_to_xx(src_cxw_f)
             loss_l1_final   = F.l1_loss(src_cxw_f, tgt_cxw, reduction="none").mean()
@@ -243,61 +258,47 @@ class VMRSetCriterion(nn.Module):
         return {"loss_contrastive_align": loss_nce.mean()}
 
     def loss_labels(self, outputs, targets, indices, log=True):
-        """Quality score loss: train fg logit to predict IoU-with-GT.
+        """Train a per-query quality logit against soft IoU targets.
 
-        Replaces binary foreground/background cross-entropy with a softer
-        formulation where matched slots are trained toward their actual
-        IoU with the matched GT span (range [0.1, 1.0]) and unmatched slots
-        are trained toward 0.0.
-
-        At inference: sigmoid(pred_logits) ≈ expected localization
-        quality — high only when the span is both foreground AND precise.
+        Matched queries are supervised toward the IoU of their assigned span,
+        after applying `iou_floor`; unmatched queries are supervised toward 0.0.
+        Because this uses weighted BCE with `pos_weight`, sigmoid(pred_logits)
+        is best interpreted as a ranking signal rather than a calibrated IoU.
         """
         assert "pred_logits" in outputs
         idx = self._src_permutation_idx(indices)
 
-        # pred_logits is now (B, Q) — single quality logit per query slot
+        # pred_logits is (B, Q) — one quality/ranking logit per query slot.
         fg_logits = outputs["pred_logits"]   # (B, Q)
-
-        # Compute actual IoU for each matched (pred, gt) pair — no gradient
-        with torch.no_grad():
-            if outputs.get("pred_spans_final") is not None and self.label_span_source == "final":
-                span_key = "pred_spans_final"
-            elif self.label_span_source == "refined" and outputs.get("pred_spans_refined") is not None:
-                span_key = "pred_spans_refined"
-            elif self.label_span_source == "matched":
-                matcher_source = getattr(self.matcher, "match_span_source", "coarse")
-                if matcher_source in {"refined", "dual"} and outputs.get("pred_spans_refined") is not None:
-                    span_key = "pred_spans_refined"
-                else:
-                    span_key = "pred_spans"
-            else:
-                span_key = "pred_spans_refined" if outputs.get("pred_spans_refined") is not None and self.label_span_source == "final" else "pred_spans"
-
-            src_spans = span_cxw_to_xx(outputs[span_key][idx])            # (#matched, 2)
-            tgt_spans = span_cxw_to_xx(
-                torch.cat(
-                    [t["spans"][j] for t, (_, j) in zip(targets["span_labels"], indices)],
-                    dim=0))                                                 # (#matched, 2)
-            iou_mat, _ = temporal_iou(src_spans, tgt_spans)
-            raw_iou   = torch.diag(iou_mat).clamp(0.0, 1.0)               # (#matched,)
-            # Use raw IoU directly with a floor of 0.1.
-            # The old formula (0.5 + 0.5 * raw_iou) set a floor of 0.5, which
-            # compressed the matched vs unmatched target gap to 0.5 vs 0.0 and
-            # weakened the quality-score gradient for the first ~15 epochs.
-            # With floor=0.1 the separation is 0.1 vs 0.0 early on and naturally
-            # grows toward 1.0 as IoU improves, giving a cleaner signal.
-            iou_scores = raw_iou.clamp(min=self.iou_floor)                    # (#matched,) in [iou_floor, 1.0]
 
         # Soft targets: matched -> IoU score, unmatched -> 0.0
         soft_targets = torch.zeros_like(fg_logits)   # (B, Q)
-        soft_targets[idx] = iou_scores
+
+        # Compute actual IoU for each matched (pred, gt) pair — no gradient.
+        if self._has_matches(indices):
+            with torch.no_grad():
+                span_key = self._resolve_label_span_key(outputs)
+                src_spans = span_cxw_to_xx(outputs[span_key][idx])            # (#matched, 2)
+                tgt_spans = span_cxw_to_xx(
+                    torch.cat(
+                        [t["spans"][j] for t, (_, j) in zip(targets["span_labels"], indices)],
+                        dim=0))                                               # (#matched, 2)
+                iou_mat, _ = temporal_iou(src_spans, tgt_spans)
+                raw_iou   = torch.diag(iou_mat).clamp(0.0, 1.0)               # (#matched,)
+                # Use raw IoU directly with a floor of 0.1.
+                # The old formula (0.5 + 0.5 * raw_iou) set a floor of 0.5, which
+                # compressed the matched vs unmatched target gap to 0.5 vs 0.0 and
+                # weakened the quality-score gradient for the first ~15 epochs.
+                # With floor=0.1 the separation is 0.1 vs 0.0 early on and naturally
+                # grows toward 1.0 as IoU improves, giving a cleaner signal.
+                iou_scores = raw_iou.clamp(min=self.iou_floor)                # (#matched,) in [iou_floor, 1.0]
+            soft_targets[idx] = iou_scores
 
         # pos_weight rebalances foreground vs background gradient.
         # With num_queries=Q and ~n_gt foreground slots per sample,
         # background slots outnumber foreground by (Q - n_gt) / n_gt.
-        # pos_weight = (Q - n_gt) / n_gt  makes gradient magnitudes equal.
-        # We estimate n_gt from soft_targets (any slot with target > 0).
+        # pos_weight = (Q - n_gt) / n_gt makes gradient magnitudes more comparable,
+        # but it does not preserve probability calibration for sigmoid(pred_logits).
         n_fg = (soft_targets > 0).float().sum().clamp(min=1)
         n_total = soft_targets.numel()
         # Cap at 25 to match the realistic Q/n_gt ratio for Charades-STA
@@ -312,11 +313,11 @@ class VMRSetCriterion(nn.Module):
             fg_logits, soft_targets, pos_weight=pos_weight, reduction="mean")
 
         losses = {"loss_label": loss_bce}
-        if log:
+        if log and idx[0].numel() > 0:
             with torch.no_grad():
                 pred_quality = fg_logits[idx].sigmoid()
                 # class_error: % of matched predictions with predicted quality < 0.5
-                # (i.e., model thinks its own matched span is low quality)
+                # (i.e., model ranks its own matched span as low quality)
                 losses["class_error"] = (
                     100.0 * (pred_quality < 0.5).float().mean())
         return losses
@@ -394,18 +395,19 @@ class VMRSetCriterion(nn.Module):
         return {"loss_saliency": total}
 
     def loss_spans_refined(self, outputs, targets, indices):
-        """Boundary + Alpha-IoU loss on BoundaryRefinementHead output.
+        """Boundary + DIoU/Alpha-IoU loss on BoundaryRefinementHead output.
 
         Reuses the same Hungarian `indices` from the coarse decoder —
-        no second matching needed.  Only smooth L1 boundary and Alpha-IoU are
-        applied (not center/width L1) because precision at the boundary
-        is the bottleneck for R1@0.7.
-
-        Alpha-IoU (L = 1 - IoU^alpha) amplifies gradient for medium-IoU
-        predictions (0.5–0.7 range), directly targeting R1@0.7 conversions.
+        no second matching needed. Only smooth L1 boundary and DIoU/Alpha-IoU
+        are applied (not center/width L1) because boundary precision is the main
+        bottleneck for R1@0.7. If a batch has no matches, return finite zeros.
         """
         if "pred_spans_refined" not in outputs or outputs["pred_spans_refined"] is None:
             return {}
+
+        zero = self._zero_loss(outputs)
+        if not self._has_matches(indices):
+            return {"loss_boundary_refined": zero, "loss_giou_refined": zero}
 
         idx     = self._src_permutation_idx(indices)
         tgt_cxw = torch.cat(
@@ -421,20 +423,25 @@ class VMRSetCriterion(nn.Module):
             for p_cxw_full in passes:
                 p_cxw = p_cxw_full[idx]                       # (#matched, 2)
                 p_xx  = span_cxw_to_xx(p_cxw)
+                loss_diou_refined = diou_temporal_loss(p_xx, tgt_xx)
+                loss_alpha_refined = alpha_iou_temporal_loss(
+                    p_xx, tgt_xx, alpha=self.alpha_iou_alpha)
                 acc_boundary = acc_boundary + F.smooth_l1_loss(
                     p_xx, tgt_xx, reduction="mean", beta=0.04)
-                acc_giou = acc_giou + alpha_iou_temporal_loss(
-                    p_xx, tgt_xx, alpha=self.alpha_iou_alpha)
+                acc_giou = acc_giou + (0.3 * loss_diou_refined + 0.7 * loss_alpha_refined)
             loss_bdy = acc_boundary / len(passes)
             loss_iou = acc_giou     / len(passes)
         else:
-            # Fall back to single-pass computation on pred_spans_refined
+            # Fall back to single-pass computation on pred_spans_refined.
             src_cxw = outputs["pred_spans_refined"][idx]      # (#matched, 2)
             src_xx  = span_cxw_to_xx(src_cxw)
             # beta=0.04 ≈ 3 frames at max_v_l=75: keeps quadratic gradient in the
             # 1–3 frame zone that separates R1@0.5 hits from R1@0.7 hits.
             loss_bdy = F.smooth_l1_loss(src_xx, tgt_xx, reduction="mean", beta=0.04)
-            loss_iou = alpha_iou_temporal_loss(src_xx, tgt_xx, alpha=self.alpha_iou_alpha)
+            loss_diou_refined = diou_temporal_loss(src_xx, tgt_xx)
+            loss_alpha_refined = alpha_iou_temporal_loss(
+                src_xx, tgt_xx, alpha=self.alpha_iou_alpha)
+            loss_iou = 0.3 * loss_diou_refined + 0.7 * loss_alpha_refined
 
         return {"loss_boundary_refined": loss_bdy, "loss_giou_refined": loss_iou}
 
@@ -506,11 +513,45 @@ class VMRSetCriterion(nn.Module):
         assert name in loss_map, f"Unknown loss: {name}"
         return loss_map[name](outputs, targets, indices)
 
+    def _zero_loss(self, outputs):
+        return outputs["pred_spans"].new_zeros(())
+
+    def _has_matches(self, indices):
+        return indices is not None and any(src.numel() > 0 for src, _ in indices)
+
+    def _resolve_label_span_key(self, outputs):
+        """Resolve which span tensor supervises the quality logit.
+
+        `matched` mirrors matcher intent as closely as possible: refined matching
+        modes use refined spans when available, otherwise supervision falls back
+        to coarse spans. For `dual`, label supervision uses refined spans when
+        available; it does not recreate the matcher's blended matching cost.
+        """
+        if self.label_span_source == "coarse":
+            return "pred_spans"
+        if self.label_span_source == "refined":
+            return "pred_spans_refined" if outputs.get("pred_spans_refined") is not None else "pred_spans"
+        if self.label_span_source == "final":
+            if outputs.get("pred_spans_final") is not None:
+                return "pred_spans_final"
+            if outputs.get("pred_spans_refined") is not None:
+                return "pred_spans_refined"
+            return "pred_spans"
+
+        matcher_source = getattr(self.matcher, "match_span_source", "coarse")
+        if matcher_source in {"refined", "dual"} and outputs.get("pred_spans_refined") is not None:
+            return "pred_spans_refined"
+        return "pred_spans"
+
     def _src_permutation_idx(self, indices):
         """Return (batch_idx, src_idx) tensors for all matched predictions."""
+        if not self._has_matches(indices):
+            device = self.empty_weight.device
+            empty = torch.empty(0, dtype=torch.int64, device=device)
+            return empty, empty
         batch_idx = torch.cat(
-            [torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
-        src_idx   = torch.cat([src for (src, _) in indices])
+            [torch.full_like(src, i) for i, (src, _) in enumerate(indices) if src.numel() > 0])
+        src_idx   = torch.cat([src for (src, _) in indices if src.numel() > 0])
         return batch_idx, src_idx
 
 
@@ -532,6 +573,8 @@ def build_criterion(cfg):
 
     matcher = build_matcher(cfg)
 
+    use_boundary_refinement = cfg.get("use_boundary_refinement", True)
+
     weight_dict = {
         "loss_span":     cfg["span_loss_coef"],
         "loss_giou":     cfg["giou_loss_coef"],
@@ -540,11 +583,11 @@ def build_criterion(cfg):
         "loss_saliency": cfg["lw_saliency"],
     }
     # Boundary refinement losses (final decoder layer only — not propagated to aux layers)
-    weight_dict["loss_boundary_refined"] = cfg.get("boundary_refine_coef",      0.0)
-    weight_dict["loss_giou_refined"]     = cfg.get("boundary_refine_giou_coef", 0.0)
+    weight_dict["loss_boundary_refined"] = cfg.get("boundary_refine_coef",      0.0) if use_boundary_refinement else 0.0
+    weight_dict["loss_giou_refined"]     = cfg.get("boundary_refine_giou_coef", 0.0) if use_boundary_refinement else 0.0
     # Final-gate supervision: trains the refine_gate on pred_spans_final
-    weight_dict["loss_span_final"]       = cfg.get("final_loss_coef_span",      0.0)
-    weight_dict["loss_giou_final"]       = cfg.get("final_loss_coef_giou",      0.0)
+    weight_dict["loss_span_final"]       = cfg.get("final_loss_coef_span",      0.0) if use_boundary_refinement else 0.0
+    weight_dict["loss_giou_final"]       = cfg.get("final_loss_coef_giou",      0.0) if use_boundary_refinement else 0.0
 
     losses = ["spans", "labels", "saliency"]
     if cfg.get("use_contrastive", False):

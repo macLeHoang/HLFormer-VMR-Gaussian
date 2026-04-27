@@ -23,7 +23,7 @@ def post_process_predictions(outputs, metas, duration_key="duration",
     """Convert raw model outputs to per-sample prediction lists.
 
     Args:
-        outputs:      dict from model.forward() – 'pred_logits', 'pred_spans'
+        outputs:      dict from model.forward() – includes 'pred_logits' and span outputs
         metas:        list of sample metadata dicts (length B)
         duration_key: key in meta that stores video duration in seconds
         top_k:        keep at most this many spans per sample (before NMS)
@@ -32,24 +32,25 @@ def post_process_predictions(outputs, metas, duration_key="duration",
     Returns:
         predictions: list of B dicts, each with
             "pred_spans":  (K, 2) float numpy, [start_sec, end_sec]
-            "pred_scores": (K,)   float numpy, foreground prob
+            "pred_scores": (K,)   float numpy, quality/ranking scores
             "vid":         str
             "qid":         int
     """
     pred_logits = outputs["pred_logits"].detach().cpu()   # (B, Q)
-    # Use the gated coarse+refined blend for inference when available (pred_spans_final,
-    # added in change #4).  When use_refined_spans is True and pred_spans_refined exists,
-    # prefer that for backward compatibility with older checkpoints.
-    # For new checkpoints pred_spans_final is the canonical inference output.
+    # Inference span selection is independent from matcher/label supervision.
+    # When use_refined_spans=True, prefer final spans, then refined spans, then
+    # coarse spans as a safe fallback for older checkpoints or disabled refinement.
     if use_refined_spans:
-        _raw = outputs.get("pred_spans_final",
-               outputs.get("pred_spans_refined",
-               outputs["pred_spans"]))
+        _raw = outputs.get("pred_spans_final")
+        if _raw is None:
+            _raw = outputs.get("pred_spans_refined")
+        if _raw is None:
+            _raw = outputs["pred_spans"]
     else:
-        _raw = outputs.get("pred_spans_final", outputs["pred_spans"])
+        _raw = outputs["pred_spans"]
     pred_spans  = _raw.detach().cpu()                     # (B, Q, 2) cxw [0,1]
 
-    # Quality score: pred_logits is now (B, Q) — single logit per query slot.
+    # Quality/ranking score: pred_logits is a single logit per query slot.
     fg_probs = pred_logits.sigmoid()                       # (B, Q)
 
     predictions = []
@@ -66,7 +67,7 @@ def post_process_predictions(outputs, metas, duration_key="duration",
         spans_sec[:, 1] = torch.maximum(
             spans_sec[:, 1], spans_sec[:, 0] + 0.01)     # ensure start < end
 
-        # Sort by foreground probability descending, keep top-k
+        # Sort by quality/ranking score descending, keep top-k
         order = probs.argsort(descending=True)[:top_k]
         probs     = probs[order]
         spans_sec = spans_sec[order]
@@ -350,8 +351,9 @@ def evaluate_vmr(model, dataloader, device, cfg):
         all_preds.extend(preds)
         all_gt.extend(gts)
 
-        if "pred_refine_gate" in outputs:
-            all_gate_means.append(outputs["pred_refine_gate"].mean().item())
+        gate = outputs.get("pred_refine_gate")
+        if gate is not None:
+            all_gate_means.append(gate.mean().item())
 
         if "saliency_all_labels" in batched_data:
             all_saliency_scores.append(outputs["saliency_scores"].cpu())
@@ -389,9 +391,7 @@ def evaluate_vmr(model, dataloader, device, cfg):
     # not just the easier one.
     r1_05  = metrics.get("R1@0.5",  metrics.get(f"R1@{iou_thresholds[0]}",  0.0))
     r1_07  = metrics.get("R1@0.7",  metrics.get(f"R1@{iou_thresholds[-1]}", 0.0))
-    map_05 = metrics.get("mAP@0.5", 0.0)
-    map_07 = metrics.get("mAP@0.7", 0.0)
-    metrics["primary"] = 0.5 * (r1_05 + r1_07) + 0.25 * (map_05 + map_07)
+    metrics["primary"] = 0.5 * (r1_05 + r1_07)
 
     if all_gate_means:
         metrics["refine_gate_mean"] = sum(all_gate_means) / len(all_gate_means)
@@ -399,5 +399,8 @@ def evaluate_vmr(model, dataloader, device, cfg):
     if hasattr(model.input_vid_proj, "stream_logits"):
         alpha = torch.softmax(model.input_vid_proj.stream_logits, dim=0).tolist()
         metrics["stream_weights"] = [round(a, 3) for a in alpha]
+    if hasattr(model.input_vid_proj, "stream_logits"):
+        alpha = torch.softmax(model.input_vid_proj.last_stream_weights, dim=0).tolist()
+        metrics["last_stream_weights"] = [round(a, 3) for a in alpha]
 
     return metrics

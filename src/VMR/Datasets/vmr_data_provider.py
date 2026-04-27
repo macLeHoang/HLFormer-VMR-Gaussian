@@ -186,13 +186,10 @@ class VMRDataset(Dataset):
         model_inputs = {}
         model_inputs["query_feat"] = self._get_query_feat(meta["qid"])   # (L_q, D_q)
         model_inputs["video_feat"] = self._get_video_feat(meta["vid"])   # (L_v, D_v)
-        ctx_l = len(model_inputs["video_feat"])                           # actual #clips
-
-        if self.use_tef:
-            tef_st = torch.arange(0, ctx_l, 1.0) / max(ctx_l, 1)
-            tef_ed = tef_st + 1.0 / max(ctx_l, 1)
-            tef = torch.stack([tef_st, tef_ed], dim=1)
-            model_inputs["video_feat"] = torch.cat([model_inputs["video_feat"], tef], dim=1)
+        orig_ctx_l = len(model_inputs["video_feat"])                     # #clips before crop
+        ctx_l = orig_ctx_l
+        orig_duration = float(meta["duration"])
+        orig_clip_len = orig_duration / max(orig_ctx_l, 1)
 
         # --- Temporal crop augmentation (training only) ---
         # Randomly crop a contiguous sub-sequence containing the GT window,
@@ -202,26 +199,33 @@ class VMRDataset(Dataset):
                 and random.random() < 0.5):
             model_inputs["video_feat"], crop_offset, ctx_l = \
                 self._temporal_crop(model_inputs["video_feat"],
-                                    meta["relevant_windows"], meta["duration"],
+                                    meta["relevant_windows"], orig_duration,
                                     ctx_l)
 
         # --- Random feature masking (training only) ---
         if self.load_labels and self.feat_mask_ratio > 0:
             model_inputs["video_feat"] = self._random_mask_clips(
                 model_inputs["video_feat"])
+            
+        if self.use_tef:
+            tef_st = torch.arange(0, ctx_l, 1.0) / max(ctx_l, 1)
+            tef_ed = tef_st + 1.0 / max(ctx_l, 1)
+            tef = torch.stack([tef_st, tef_ed], dim=1)
+            model_inputs["video_feat"] = torch.cat([model_inputs["video_feat"], tef], dim=1)
 
         if self.load_labels:
             # Adjust GT windows for any temporal crop offset
             adjusted_windows = meta["relevant_windows"]
-            adjusted_duration = meta["duration"]
-            if crop_offset > 0 or ctx_l != len(model_inputs["video_feat"]):
-                adjusted_duration = ctx_l * self.clip_len
+            adjusted_duration = orig_duration
+            if crop_offset > 0 or ctx_l != orig_ctx_l:
+                adjusted_duration = max(orig_clip_len * ctx_l, 1e-6)
+                crop_shift = crop_offset * orig_clip_len
                 adjusted_windows = [
-                    [max(0, w[0] - crop_offset * self.clip_len),
-                     min(adjusted_duration, w[1] - crop_offset * self.clip_len)]
+                    [max(0.0, w[0] - crop_shift),
+                     min(adjusted_duration, w[1] - crop_shift)]
                     for w in meta["relevant_windows"]
                 ]
-                adjusted_windows = [[max(0, s), max(0, e)]
+                adjusted_windows = [[max(0.0, s), max(0.0, e)]
                                     for s, e in adjusted_windows]
 
             # GT jitter: randomly perturb boundaries by a few frames
@@ -284,20 +288,21 @@ class VMRDataset(Dataset):
 
     def _get_video_feat(self, vid):
         feat_list = []
+        raw_lengths = []
+
         for feat_dir in self.v_feat_dirs:
             path = join(feat_dir, f"{vid}.npz")
-            feat = np.load(path)["features"][:self.max_v_l].astype(np.float32)
-            if self.normalize_v:
-                feat = l2_normalize_np_array(feat)
+            feat = np.load(path)["features"].astype(np.float32)
+            raw_lengths.append(len(feat))
             feat_list.append(feat)
 
-        target_len = self._aligned_video_length_from_lengths([len(f) for f in feat_list])
-        if self.v_feat_len_mode == "max":
-            # Resample shorter sources up to the longest (no data discarded)
-            feat_list = [resample_feat(f, target_len) for f in feat_list]
-        else:  # "min"
-            # Truncate to the shortest (no interpolation artefacts)
-            feat_list = [f[:target_len] for f in feat_list]
+        target_len = self._aligned_video_length_from_lengths(raw_lengths)
+        target_len = min(target_len, self.max_v_l)
+
+        feat_list = [resample_feat(f, target_len) for f in feat_list]
+
+        if self.normalize_v:
+            feat_list = [l2_normalize_np_array(f) for f in feat_list]
 
         feat = np.concatenate(feat_list, axis=1)
         return torch.from_numpy(feat)   # (target_len, D_v)
@@ -315,8 +320,9 @@ class VMRDataset(Dataset):
         raw_lengths_per_stream = [[] for _ in self.v_feat_dirs]
         final_ctx_lengths = []
         durations = []
-        implied_durations = []
-        mismatch_count = 0
+        aligned_clip_lens = []
+        stream_length_mismatch_count = 0
+        cfg_clip_len_mismatch_count = 0
         clamp_count = 0
         load_failures = 0
 
@@ -332,14 +338,19 @@ class VMRDataset(Dataset):
 
                 ctx_l = self._aligned_video_length_from_lengths(stream_lengths)
                 duration = float(meta.get("duration", 0.0))
-                implied_duration = float(ctx_l * self.clip_len)
+                aligned_clip_len = duration / max(ctx_l, 1)
 
                 final_ctx_lengths.append(ctx_l)
                 durations.append(duration)
-                implied_durations.append(implied_duration)
+                aligned_clip_lens.append(aligned_clip_len)
 
-                if abs(duration - implied_duration) > 1e-3:
-                    mismatch_count += 1
+                if len(set(stream_lengths)) > 1:
+                    stream_length_mismatch_count += 1
+
+                if self.clip_len > 0:
+                    rel_err = abs(aligned_clip_len - self.clip_len) / max(self.clip_len, 1e-6)
+                    if rel_err > 0.05:
+                        cfg_clip_len_mismatch_count += 1
 
                 if self.load_labels:
                     total_len = max(duration, 1e-6)
@@ -355,13 +366,15 @@ class VMRDataset(Dataset):
         summary = {
             "samples": len(samples),
             "load_failures": load_failures,
-            "mismatch_count": mismatch_count,
-            "mismatch_ratio": mismatch_count / max(len(samples), 1),
+            "stream_length_mismatch_count": stream_length_mismatch_count,
+            "stream_length_mismatch_ratio": stream_length_mismatch_count / max(len(samples), 1),
+            "cfg_clip_len_mismatch_count": cfg_clip_len_mismatch_count,
+            "cfg_clip_len_mismatch_ratio": cfg_clip_len_mismatch_count / max(len(samples), 1),
             "span_clamp_count": clamp_count,
             "span_clamp_ratio": clamp_count / max(len(samples), 1),
             "ctx_l_mean": mean(final_ctx_lengths) if final_ctx_lengths else 0.0,
             "duration_mean": mean(durations) if durations else 0.0,
-            "implied_duration_mean": mean(implied_durations) if implied_durations else 0.0,
+            "aligned_clip_len_mean": mean(aligned_clip_lens) if aligned_clip_lens else 0.0,
         }
         for i, vals in enumerate(raw_lengths_per_stream):
             summary[f"stream{i}_raw_len_mean"] = mean(vals) if vals else 0.0
@@ -451,6 +464,7 @@ class VMRDataset(Dataset):
             random.shuffle(windows)
             windows = windows[:self.max_windows]
 
+        # total_len = ctx_l * self.clip_len
         total_len = max(float(duration), 1e-6)
         windows_t = torch.tensor(windows, dtype=torch.float32)
         windows_norm = windows_t / total_len        # normalize to [0, 1]

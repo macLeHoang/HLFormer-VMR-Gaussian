@@ -261,15 +261,25 @@ class VMRDecoderLayer(nn.Module):
         v2  = self.ca_v(memory)
         # Build additive attn_mask for cross-attention if saliency bias provided
         ca_attn_mask = None
+        ca_key_padding_mask = memory_key_padding_mask
         if cross_attn_bias is not None:
             B, L_mem = cross_attn_bias.shape
             nh = self.cross_attn.num_heads
             Lq = tgt.shape[1]  # batch_first=True, so dim 1 is query length
-            bias = cross_attn_bias.view(B, 1, 1, L_mem).expand(B, nh, Lq, L_mem)
+            bias = cross_attn_bias.to(device=q2.device, dtype=q2.dtype)
+            bias = bias.view(B, 1, 1, L_mem).expand(B, nh, Lq, L_mem)
             ca_attn_mask = bias.reshape(B * nh, Lq, L_mem)
+            if memory_key_padding_mask is not None:
+                ca_key_padding_mask = torch.zeros(
+                    memory_key_padding_mask.shape,
+                    dtype=ca_attn_mask.dtype,
+                    device=ca_attn_mask.device,
+                )
+                ca_key_padding_mask = ca_key_padding_mask.masked_fill(
+                    memory_key_padding_mask.bool(), float("-inf"))
         tgt2, _ = self.cross_attn(q2, k2, v2,
                                    attn_mask=ca_attn_mask,
-                                   key_padding_mask=memory_key_padding_mask)
+                                   key_padding_mask=ca_key_padding_mask)
         tgt = self.norm2(tgt + self.drop2(tgt2))
 
         # FFN
@@ -366,40 +376,77 @@ class MultiStreamVidProjection(nn.Module):
         dropout     : float      dropout probability for each LinearLayer
 
     Forward:
-        x : (B, L, sum(stream_dims))
+        x_visual : (B, L, sum(stream_dims))
+        tef      : (B, L, tef_dim) optional temporal endpoint features
         returns (B, L, H)
     """
 
-    def __init__(self, stream_dims: list, H: int, dropout: float = 0.1):
+    def __init__(self, stream_dims: list, H: int, dropout: float = 0.1, n_proj=2, tef_dim=0):
         super().__init__()
-        assert len(stream_dims) >= 1, "stream_dims must have at least one element"
+        if len(stream_dims) < 1:
+            raise ValueError("stream_dims must have at least one element")
         self.stream_dims = stream_dims
+        self.tef_dim = tef_dim
+
+        relu_args = [True] * n_proj
+        if n_proj >= 3:
+            relu_args[-1] = False
 
         self.stream_projs = nn.ModuleList([
-            LinearLayer(dim, H, layer_norm=True, dropout=dropout, relu=True)
+            nn.Sequential(*[
+                LinearLayer((dim + tef_dim) if i == 0 else H, H,
+                            layer_norm=True, dropout=dropout,
+                            relu=relu_args[i])
+                for i in range(n_proj)
+            ])
             for dim in stream_dims
         ])
 
         n = len(stream_dims)
+        self.last_stream_weights = None
         if n > 1:
-            # Learned per-stream importance logits; zeros → uniform (= current behaviour) at init.
-            # softmax(stream_logits) is inspectable after training to see which stream dominates.
             self.stream_logits = nn.Parameter(torch.zeros(n))
             self.fusion = nn.Sequential(
                 nn.Linear(n * H, H, bias=False),
                 nn.LayerNorm(H),
                 nn.GELU(),
             )
+            self.stream_gate = nn.Sequential(
+                nn.LayerNorm(H),
+                nn.Linear(H, H // 2),
+                nn.GELU(),
+                nn.Linear(H // 2, 1),
+            )
+            self.fusion_norm = nn.LayerNorm(H)
+            nn.init.zeros_(self.stream_gate[-1].weight)
+            nn.init.zeros_(self.stream_gate[-1].bias)
         else:
             self.fusion = nn.Identity()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        streams = x.split(self.stream_dims, dim=-1)           # tuple of (B, L, dim_i)
-        projected = [proj(s) for proj, s in zip(self.stream_projs, streams)]
+    def forward(self, x_visual: torch.Tensor, tef: torch.Tensor = None) -> torch.Tensor:
+        if self.tef_dim > 0:
+            if tef is None:
+                raise ValueError("tef must be provided when tef_dim > 0")
+            if tef.shape[-1] != self.tef_dim:
+                raise ValueError(
+                    f"tef feature dim mismatch: got {tef.shape[-1]}, expected {self.tef_dim}")
+        elif tef is not None:
+            raise ValueError("tef must be None when tef_dim == 0")
+
+        streams = x_visual.split(self.stream_dims, dim=-1)    # tuple of (B, L, dim_i)
+        if self.tef_dim > 0:
+            projected = [proj(torch.cat([s, tef], dim=-1))
+                         for proj, s in zip(self.stream_projs, streams)]
+        else:
+            projected = [proj(s) for proj, s in zip(self.stream_projs, streams)]
         if len(projected) > 1:
-            alpha = F.softmax(self.stream_logits, dim=0)      # (n,) — learned stream weights
-            projected = [a * p for a, p in zip(alpha, projected)]
-            return self.fusion(torch.cat(projected, dim=-1))  # (B, L, H)
+            stacked = torch.stack(projected, dim=2)
+            gate_logits = self.stream_gate(stacked).squeeze(-1) + self.stream_logits.view(1, 1, -1)
+            alpha = F.softmax(gate_logits, dim=-1)
+            adaptive_fused = (alpha.unsqueeze(-1) * stacked).sum(dim=2)
+            self.last_stream_weights = alpha.detach().mean(dim=(0, 1))
+
+            return adaptive_fused
         return projected[0]                                   # (B, L, H)
 
 
@@ -557,28 +604,32 @@ class GaussianFormer_VMR(nn.Module):
         H = config.hidden_size
 
         # ---- Video feature projection -----------------------------------
-        #  Two modes controlled by config:
-        #
-        #  Multi-stream (recommended):
-        #    config.v_feat_dims = [dim1, dim2, ...]  e.g. [2304, 512, 768]
-        #    → MultiStreamVidProjection: one LinearLayer per stream + fusion.
-        #    → Works for any subset: CLIP-only [512], SF+CLIP [2304,512], etc.
-        #    → config.v_feat_dim is auto-set to sum(v_feat_dims) if absent.
-        #
-        #  Single-stream (legacy / backward-compat):
-        #    config.v_feat_dims absent or single-element list
-        #    → stacked n_input_proj LinearLayers: feat_dim→H→H (QD-DETR style).
+        #  Multi-stream is automatic for multi-entry v_feat_dims unless
+        #  config.use_multistream_projection explicitly forces True/False.
+        #  TEF stays outside v_feat_dims; for multistream video it is injected
+        #  into each branch, while the legacy concatenated path consumes
+        #  [visual | tef] together before projection.
         _stream_dims = getattr(config, "v_feat_dims", None)
-        if _stream_dims and len(_stream_dims) > 1:
+        self._visual_vid_dim = sum(_stream_dims) if _stream_dims else config.v_feat_dim
+        self._tef_dim = 2 if getattr(config, "use_tef", False) else 0
+        self._use_ms_vid = getattr(config, "use_multistream_projection", None)
+        if self._use_ms_vid is None:
+            self._use_ms_vid = bool(_stream_dims and len(_stream_dims) > 1)
+
+        _n_proj    = getattr(config, "n_input_proj", 2)
+
+        if self._use_ms_vid:
+            if not _stream_dims:
+                raise ValueError("use_multistream_projection=True requires config.v_feat_dims")
             self.input_vid_proj = MultiStreamVidProjection(
-                _stream_dims, H, dropout=config.input_drop)
+                _stream_dims, H, dropout=config.input_drop, n_proj=_n_proj,
+                tef_dim=self._tef_dim)
         else:
-            # Legacy single-stream: n_input_proj stacked layers
-            _n_proj    = getattr(config, "n_input_proj", 2)
+            # Legacy concatenated projection: n_input_proj stacked layers
             _relu_args = [True] * _n_proj
             if _n_proj >= 3:
                 _relu_args[-1] = False
-            _in_dim = _stream_dims[0] if _stream_dims else config.v_feat_dim
+            _in_dim = self._visual_vid_dim + self._tef_dim
             self.input_vid_proj = nn.Sequential(*[
                 LinearLayer(_in_dim if i == 0 else H, H,
                             layer_norm=True, dropout=config.input_drop,
@@ -587,11 +638,16 @@ class GaussianFormer_VMR(nn.Module):
             ])
 
         # ---- Text feature projection ------------------------------------
-        #  Same multi-stream logic as video: set config.t_feat_dims as a list
-        #  e.g. [512, 768] for CLIP+BLIP text, [512] for CLIP-only.
-        #  Falls back to stacked n_input_proj layers when t_feat_dims is absent.
+        #  Multi-stream is automatic for multi-entry t_feat_dims unless
+        #  config.use_multistream_text_projection explicitly forces True/False.
         _txt_stream_dims = getattr(config, "t_feat_dims", None)
-        if _txt_stream_dims and len(_txt_stream_dims) > 1:
+        _use_ms_txt = getattr(config, "use_multistream_text_projection", None)
+        if _use_ms_txt is None:
+            _use_ms_txt = bool(_txt_stream_dims and len(_txt_stream_dims) > 1)
+
+        if _use_ms_txt:
+            if not _txt_stream_dims:
+                raise ValueError("use_multistream_text_projection=True requires config.t_feat_dims")
             self.input_txt_proj = MultiStreamVidProjection(
                 _txt_stream_dims, H, dropout=config.input_drop)
         else:
@@ -599,7 +655,7 @@ class GaussianFormer_VMR(nn.Module):
             _relu_args_t = [True] * _n_proj_t
             if _n_proj_t >= 3:
                 _relu_args_t[-1] = False
-            _in_dim_t = _txt_stream_dims[0] if _txt_stream_dims else config.t_feat_dim
+            _in_dim_t = sum(_txt_stream_dims) if _txt_stream_dims else config.t_feat_dim
             self.input_txt_proj = nn.Sequential(*[
                 LinearLayer(_in_dim_t if i == 0 else H, H,
                             layer_norm=True, dropout=config.input_drop,
@@ -623,7 +679,14 @@ class GaussianFormer_VMR(nn.Module):
                 batch_first=True,
                 norm_first=False,
             )
-            self.txt_encoder = nn.TransformerEncoder(txt_layer, num_layers=_txt_enc_layers)
+            try:
+                self.txt_encoder = nn.TransformerEncoder(
+                    txt_layer,
+                    num_layers=_txt_enc_layers,
+                    enable_nested_tensor=False,
+                )
+            except TypeError:
+                self.txt_encoder = nn.TransformerEncoder(txt_layer, num_layers=_txt_enc_layers)
         else:
             self.txt_encoder = None
 
@@ -662,6 +725,11 @@ class GaussianFormer_VMR(nn.Module):
         # ---- Decoder (iterative reference-point refinement) ------------
         decoder_layer = VMRDecoderLayer(H, config.n_heads, dropout=config.drop)
         self.decoder  = VMRDecoder(decoder_layer, config.dec_layers, H)
+
+        self._use_mem_kv_for_txt_memory = getattr(config, "use_mem_kv_for_txt_memory", False)
+        self.txt_memory_attn = nn.MultiheadAttention(
+            H, config.n_heads, dropout=config.drop, batch_first=True)
+        self.txt_memory_norm = nn.LayerNorm(H)
 
         # Query slots: content embedding + reference point initialisation
         self.query_content_embed = nn.Embedding(config.num_queries, H)
@@ -705,10 +773,11 @@ class GaussianFormer_VMR(nn.Module):
         self.caq_ref_init = MLP(H, H, 2, 2)
 
         # ---- Prediction heads ------------------------------------------
-        self.class_head  = nn.Linear(H, 1)   # single quality logit; [..0] indexing removed
+        self.class_head  = nn.Linear(H, 1)   # single per-query quality/ranking logit
         # Gate that learns per-query when to trust boundary refinement vs coarse spans.
         # Bias=-1.0 so initial gate≈0.27 — refinement contributes but doesn't dominate at ep0.
         self.refine_gate = nn.Linear(H, 1)
+        self._use_boundary_refinement = getattr(config, "use_boundary_refinement", True)
 
         # ---- Saliency projections --------------------------------------
         self.saliency_proj1 = nn.Linear(H, H)
@@ -755,19 +824,20 @@ class GaussianFormer_VMR(nn.Module):
         # gradient reaches the head from step 1.  Head contribution is bounded by
         # boundary_refine_coef=0.5 in the loss schedule.
         # Zero-init text+width conditioning terms so ep0 behaviour = scalar base sigma.
-        nn.init.zeros_(self.boundary_refine.sigma_txt_proj.weight)
-        nn.init.zeros_(self.boundary_refine.sigma_txt_proj.bias)
-        if self.boundary_refine.learnable_sigma:
-            nn.init.zeros_(self.boundary_refine.sigma_width_scale_start)
-            nn.init.zeros_(self.boundary_refine.sigma_width_scale_end)
-        # Small-normal init for text portion of joint_mlp first layer (columns 2H:3H).
-        # Was zero-init: text input was stuck behind a zero floor and required large
-        # gradients to activate. std=0.01 lets text inform refinement from step 1
-        # while staying small enough that it doesn't corrupt the ep0 boundary estimate.
-        with torch.no_grad():
-            _H = self.boundary_refine._H
-            nn.init.normal_(self.boundary_refine.joint_mlp.layers[0].weight[:, 2 * _H:],
-                            mean=0.0, std=0.01)
+        if getattr(self, "boundary_refine", None) is not None:
+            nn.init.zeros_(self.boundary_refine.sigma_txt_proj.weight)
+            nn.init.zeros_(self.boundary_refine.sigma_txt_proj.bias)
+            if self.boundary_refine.learnable_sigma:
+                nn.init.zeros_(self.boundary_refine.sigma_width_scale_start)
+                nn.init.zeros_(self.boundary_refine.sigma_width_scale_end)
+            # Small-normal init for text portion of joint_mlp first layer (columns 2H:3H).
+            # Was zero-init: text input was stuck behind a zero floor and required large
+            # gradients to activate. std=0.01 lets text inform refinement from step 1
+            # while staying small enough that it doesn't corrupt the ep0 boundary estimate.
+            with torch.no_grad():
+                _H = self.boundary_refine._H
+                nn.init.normal_(self.boundary_refine.joint_mlp.layers[0].weight[:, 2 * _H:],
+                                mean=0.0, std=0.01)
         # Zero-init caq_ref_head final layer so initial reference-point offsets=0.
         # This means at ep0 CAQ produces the same reference points as the static
         # uniform linspace init, and the offset grows as training progresses.
@@ -783,9 +853,9 @@ class GaussianFormer_VMR(nn.Module):
         # activates as training progresses.
         nn.init.zeros_(self.caq_attn.out_proj.weight)
         nn.init.zeros_(self.caq_attn.out_proj.bias)
-        # Init refine_gate bias to 0.0 so sigmoid(0 * x + 0) = 0.5 at ep0.
-        # gate=0.5 init now safe with smaller max_delta (v5).
-        nn.init.constant_(self.refine_gate.bias, 0.0)   # v5: was -1.0; gate=0.5 init now safe with smaller max_delta
+        # Initialize refine_gate conservatively and deterministically.
+        nn.init.zeros_(self.refine_gate.weight)
+        nn.init.constant_(self.refine_gate.bias, -2.0)
         # Spread decoder query reference points uniformly: cx in [0.1, 0.9], w = 0.3
         # sigmoid(query_embed.weight) is used as the initial reference point in _decode,
         # so we store inv_sigmoid of the desired initial values.
@@ -920,19 +990,30 @@ class GaussianFormer_VMR(nn.Module):
         H        = self.config.hidden_size
         aux_loss = getattr(self.config, "aux_loss", False)
 
-        expected_vid_dim = sum(getattr(self.config, "v_feat_dims", [self.config.v_feat_dim]))
+        expected_vid_dim = self._visual_vid_dim + self._tef_dim
         if src_vid.shape[-1] != expected_vid_dim:
             raise ValueError(
                 f"src_vid feature dim mismatch: got {src_vid.shape[-1]}, expected {expected_vid_dim}. "
                 f"Check v_feat_dims/v_feat_dim and use_tef config alignment."
             )
 
+        if self._tef_dim > 0:
+            src_vid_main = src_vid[..., :self._visual_vid_dim]
+            src_vid_tef  = src_vid[..., self._visual_vid_dim:]
+        else:
+            src_vid_main = src_vid
+            src_vid_tef  = None
+
         # ---- 1. Encode text ------------------------------------------
         txt_feat = self._encode_query(src_txt, src_txt_mask)    # (B, L_t, H)
 
         # ---- 2. Project video (reused for negative pair) -------------
-        vid_feat_proj = self.vid_pos_embed(
-            self.input_vid_proj(src_vid))                        # (B, L_v, H)
+        if self._use_ms_vid:
+            vid_feat_proj = self.input_vid_proj(src_vid_main, src_vid_tef)
+        else:
+            vid_input = src_vid if src_vid_tef is not None else src_vid_main
+            vid_feat_proj = self.input_vid_proj(vid_input)
+        vid_feat_proj = self.vid_pos_embed(vid_feat_proj)       # (B, L_v, H)
 
         # ---- 2b. Feature noise augmentation (training only) ----------
         # Adds small Gaussian noise to projected features to regularize
@@ -967,7 +1048,24 @@ class GaussianFormer_VMR(nn.Module):
 
         # ---- 4. Decoder memory (video only, or [video | text]) ----------
         if getattr(self.config, "use_txt_in_memory", True):
-            memory      = torch.cat([vid_feat, txt_feat], dim=1)
+            txt_memory = txt_feat
+            if self._use_mem_kv_for_txt_memory:
+                mem_kv = torch.cat([global_rep.unsqueeze(1), vid_feat], dim=1)
+                mem_kv_mask = torch.cat([
+                    torch.ones(src_vid_mask.shape[0], 1,
+                               dtype=src_vid_mask.dtype,
+                               device=src_vid_mask.device),
+                    src_vid_mask,
+                ], dim=1)
+                txt_ctx, _ = self.txt_memory_attn(
+                    query=txt_feat,
+                    key=mem_kv,
+                    value=mem_kv,
+                    key_padding_mask=(mem_kv_mask == 0),
+                )
+                txt_memory = self.txt_memory_norm(txt_feat + txt_ctx)
+
+            memory      = torch.cat([vid_feat, txt_memory], dim=1)
             memory_mask = torch.cat([src_vid_mask, src_txt_mask], dim=1)
         else:
             memory      = vid_feat
@@ -1018,16 +1116,22 @@ class GaussianFormer_VMR(nn.Module):
         pred_spans  = spans_per_layer[-1]                        # (B, Q, 2)
 
         # ---- 5b. Boundary refinement (local Gaussian pooling + MLP) --
-        pred_spans_refined, refined_passes = self.boundary_refine(
-            pred_spans, vid_feat, src_vid_mask,
-            txt_rep=global_rep)                               # (B, Q, 2)
+        if self._use_boundary_refinement:
+            pred_spans_refined, refined_passes = self.boundary_refine(
+                pred_spans, vid_feat, src_vid_mask,
+                txt_rep=global_rep)                               # (B, Q, 2)
 
-        # ---- 5c. Learned gate: blend coarse and refined spans --------
-        # gate ≈ 0.27 at ep0 (refine_gate.bias=-1.0); grows as training progresses.
-        # This removes unconditional refinement application, preventing the
-        # boundary_refine loss-coef ramp from starving the coarse decoder gradient.
-        gate = torch.sigmoid(self.refine_gate(dec_out))         # (B, Q, 1)
-        pred_spans_final = gate * pred_spans_refined + (1.0 - gate) * pred_spans  # (B, Q, 2)
+            # ---- 5c. Learned gate: blend coarse and refined spans --------
+            # gate starts near 0.12 at ep0 (refine_gate.bias=-2.0) and grows as training progresses.
+            # This removes unconditional refinement application, preventing the
+            # boundary_refine loss-coef ramp from starving the coarse decoder gradient.
+            gate = torch.sigmoid(self.refine_gate(dec_out))         # (B, Q, 1)
+            pred_spans_final = gate * pred_spans_refined + (1.0 - gate) * pred_spans  # (B, Q, 2)
+        else:
+            pred_spans_refined = None
+            refined_passes = None
+            gate = None
+            pred_spans_final = None
 
         # ---- 6. Saliency (negative pair — cyclic text shift) ---------
         #  v31: simplified from full encoder re-run to shifted dot product.
@@ -1053,16 +1157,17 @@ class GaussianFormer_VMR(nn.Module):
         # ---- 9. Collect output ---------------------------------------
         out = {
             "pred_logits":         pred_logits,
-            "pred_spans":          pred_spans,              # COARSE decoder output (for loss_spans)
-            "pred_spans_refined":        pred_spans_refined,      # (B, Q, 2) – raw refined (for loss_spans_refined)
-            "pred_spans_refined_passes": refined_passes,           # list[Tensor(B,Q,2)] – per-pass spans (deep-supervision)
-            "pred_spans_final":    pred_spans_final,        # gated coarse+refined blend — used at inference
-            "pred_refine_gate":    gate,                    # (B, Q, 1) – in [0,1], diagnostic
+            "pred_spans":          pred_spans,              # canonical coarse spans for matching/aux losses
             "saliency_scores":     saliency_scores,
             "saliency_scores_neg": saliency_scores_neg,
             "video_mask":          src_vid_mask,
             "text_mask":           src_txt_mask,            # (B, L_t) – for contrastive-align mask
         }
+        if pred_spans_refined is not None:
+            out["pred_spans_refined"] = pred_spans_refined          # refined spans for optional refinement/labelling paths
+            out["pred_spans_refined_passes"] = refined_passes       # list[Tensor(B,Q,2)] – per-pass spans (deep supervision)
+            out["pred_spans_final"] = pred_spans_final              # inference-preferred final spans: final -> refined -> coarse fallback
+            out["pred_refine_gate"] = gate                          # (B, Q, 1) – in [0,1], diagnostic
 
         # ---- 10. Contrastive alignment (optional) --------------------
         if self._use_contrastive:
@@ -1098,12 +1203,4 @@ class GaussianFormer_VMR(nn.Module):
 
 def build_model(cfg):
     """Build GaussianFormer_VMR from a config dict."""
-    cfg = dict(cfg)
-    if cfg.get("use_tef", False):
-        stream_dims = cfg.get("v_feat_dims", None)
-        if stream_dims is not None and len(stream_dims) == len(cfg.get("v_feat_dirs", [])):
-            cfg["v_feat_dims"] = list(stream_dims) + [2]
-            cfg["v_feat_dim"] = sum(cfg["v_feat_dims"])
-        else:
-            cfg["v_feat_dim"] = cfg.get("v_feat_dim", 0) + 2
-    return GaussianFormer_VMR(edict(cfg))
+    return GaussianFormer_VMR(edict(dict(cfg)))
