@@ -124,6 +124,7 @@ cfg["top_k"]          = 5            # keep top-K spans before NMS
 # ---- Validation schedule -------------------------------------------------
 cfg["val_interval"]         = 5   # validate every N epochs before val_dense_from_epoch
 cfg["val_dense_from_epoch"] = 40  # switch to per-epoch validation from this epoch
+cfg["log_raw_val_metrics"]  = False  # Dump the full raw metrics dict after the formatted summary.
 
 
 def get_cfg_defaults():

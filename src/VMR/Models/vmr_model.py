@@ -504,10 +504,18 @@ class BoundaryRefinementHead(nn.Module):
         # Text-conditioned sigma offset: maps global cross-modal rep → 2 scalars
         # (one per boundary).  Zero-init → text starts contributing nothing.
         self.sigma_txt_proj = nn.Linear(H, 2, bias=True)
-        # Joint MLP: takes concatenated (start_feat, end_feat, txt_rep, query_feat)
-        # → (delta_s, delta_e). Text and decoder-query context let the MLP decide
-        # *which direction* to shift based on query semantics and slot content.
-        self.joint_mlp = MLP(4 * H, H, 2, 2)
+        # Geometry and local contrast features are important for deciding the
+        # direction of the boundary shift. Symmetric boundary pooling alone sees
+        # "what is near the boundary" but not whether the event evidence is
+        # stronger just inside or just outside the current span.
+        self.geom_proj = MLP(3, H, H, 2)
+        self.joint_norm = nn.LayerNorm(7 * H)
+        # Joint MLP input:
+        #   start boundary feat, end boundary feat,
+        #   start right-left contrast, end left-right contrast,
+        #   geometry embedding, text rep, decoder query feat.
+        self.joint_mlp = MLP(7 * H, H, 2, 3)
+        self.delta_gate = MLP(7 * H, H, 2, 2)
 
     def forward(
         self,
@@ -527,10 +535,15 @@ class BoundaryRefinementHead(nn.Module):
         # Pre-compute fixed quantities shared across passes.
         t_pos   = (torch.arange(L, device=dev, dtype=vid_feat.dtype) + 0.5) / L  # (L,)
         min_sig = 1.0 / (4.0 * L)                               # floor: 0.25 frames
+        max_sig = max(0.25, min_sig)                            # cap: local quarter-video window
+        log_min_sig = math.log(min_sig)
+        log_max_sig = math.log(max_sig)
+        min_width = 1.0 / float(L)                              # keep at least one frame
 
         if txt_rep is not None:
-            # Bound text offset to ±0.5 * log_range so sigma_txt_proj can't explode.
-            _log_range = math.log(max(float(L) * min_sig * 4.0, 1.0 + 1e-6))
+            # Bound text offset to a real local sigma range. The previous
+            # expression collapsed to ~1e-6 because L * min_sig * 4 == 1.
+            _log_range = log_max_sig - log_min_sig
             txt_off = torch.tanh(self.sigma_txt_proj(txt_rep)) * (0.5 * _log_range)  # (B, 2)
             txt_off_s = txt_off[:, 0:1]                          # (B, 1)
             txt_off_e = txt_off[:, 1:2]                          # (B, 1)
@@ -550,6 +563,31 @@ class BoundaryRefinementHead(nn.Module):
             w = w / (w.sum(-1, keepdim=True).clamp(min=1e-8))
             return torch.einsum("bql,blh->bqh", w, vid_feat)  # (B, Q, H)
 
+        def _bounded_delta(raw, anchor):
+            # Avoid relying on clamp(start + delta), which gives zero gradient
+            # when a proposed update crosses the video boundary.
+            raw = torch.tanh(raw)
+            max_delta = torch.full_like(anchor, float(self.max_delta))
+            pos_limit = torch.minimum(max_delta, 1.0 - anchor)
+            neg_limit = torch.minimum(max_delta, anchor)
+            return torch.where(raw >= 0.0, raw * pos_limit, raw * neg_limit)
+
+        def _span_from_boundaries(start_candidate, end_candidate):
+            # Keep the refined interval valid even when independent start/end
+            # deltas cross. The one-frame floor avoids collapsed spans, which are
+            # especially harmful for IoU-style supervision.
+            left = torch.minimum(start_candidate.clamp(0., 1.),
+                                 end_candidate.clamp(0., 1.))
+            right = torch.maximum(start_candidate.clamp(0., 1.),
+                                  end_candidate.clamp(0., 1.))
+            width = (right - left).clamp(min=min_width, max=1.0)
+            half_width = width * 0.5
+            center = (left + right) * 0.5
+            center = torch.maximum(torch.minimum(center, 1.0 - half_width), half_width)
+            start_out = center - half_width
+            end_out = center + half_width
+            return start_out, end_out, torch.stack([center, width], dim=-1)
+
         all_passes = []  # list of (B, Q, 2) tensors, one per pass
 
         for _pass_idx in range(self.num_passes):
@@ -563,24 +601,43 @@ class BoundaryRefinementHead(nn.Module):
             log_sigma_e = (self.log_sigma_end
                            + self.sigma_width_scale_end   * width
                            + txt_off_e)                        # (B, Q)
-            sigma_s = log_sigma_s.exp().clamp(min=min_sig)     # (B, Q)
-            sigma_e = log_sigma_e.exp().clamp(min=min_sig)     # (B, Q)
+            log_sigma_s = log_sigma_s.clamp(min=log_min_sig, max=log_max_sig)
+            log_sigma_e = log_sigma_e.clamp(min=log_min_sig, max=log_max_sig)
+            sigma_s = log_sigma_s.exp()                        # (B, Q)
+            sigma_e = log_sigma_e.exp()                        # (B, Q)
 
             start_feat = _pool(start, sigma_s)                 # (B, Q, H)
             end_feat   = _pool(end,   sigma_e)                 # (B, Q, H)
 
-            # Joint prediction: start and end deltas conditioned on both
-            # boundaries + text + decoder query content. Shared weights across passes.
-            joint_feat = torch.cat([start_feat, end_feat, txt_expand, query_feat], dim=-1)  # (B, Q, 4H)
-            deltas     = torch.tanh(self.joint_mlp(joint_feat)) * self.max_delta  # (B, Q, 2)
-            delta_s    = deltas[..., 0]                        # (B, Q)
-            delta_e    = deltas[..., 1]                        # (B, Q)
+            # Directional evidence around each boundary. For the start boundary,
+            # right-left compares inside-vs-before; for the end boundary,
+            # left-right compares inside-vs-after.
+            start_left  = _pool((start - sigma_s).clamp(0., 1.), sigma_s)
+            start_right = _pool((start + sigma_s).clamp(0., 1.), sigma_s)
+            end_left    = _pool((end   - sigma_e).clamp(0., 1.), sigma_e)
+            end_right   = _pool((end   + sigma_e).clamp(0., 1.), sigma_e)
+            start_contrast = start_right - start_left
+            end_contrast   = end_left - end_right
 
-            start_r  = (start + delta_s).clamp(0., 1.)
-            end_r    = (end   + delta_e).clamp(0., 1.)
-            center_r = (start_r + end_r) / 2.0
-            width_r  = (end_r - start_r).clamp(min=1e-6)
-            pass_span = torch.stack([center_r, width_r], dim=-1)  # (B, Q, 2)
+            geom = torch.stack([start, end, width], dim=-1)    # (B, Q, 3)
+            geom_feat = self.geom_proj(geom)                   # (B, Q, H)
+
+            # Joint prediction: start and end deltas conditioned on local
+            # boundary evidence, span geometry, text, and decoder query content.
+            # Shared weights across passes.
+            joint_feat = torch.cat([
+                start_feat, end_feat,
+                start_contrast, end_contrast,
+                geom_feat, txt_expand, query_feat,
+            ], dim=-1)                                         # (B, Q, 7H)
+            joint_feat = self.joint_norm(joint_feat)
+            raw_deltas = self.joint_mlp(joint_feat)             # (B, Q, 2)
+            delta_conf = torch.sigmoid(self.delta_gate(joint_feat))
+            delta_s    = _bounded_delta(raw_deltas[..., 0], start) * delta_conf[..., 0]
+            delta_e    = _bounded_delta(raw_deltas[..., 1], end)   * delta_conf[..., 1]
+
+            start_r, end_r, pass_span = _span_from_boundaries(start + delta_s,
+                                                              end   + delta_e)
             all_passes.append(pass_span)
 
             # Update boundaries for next pass.
@@ -781,6 +838,7 @@ class GaussianFormer_VMR(nn.Module):
         # Gate that learns per-query when to trust boundary refinement vs coarse spans.
         # Bias=-3.0 so initial gate≈0.05 — refinement starts conservatively at ep0.
         self.refine_gate = nn.Linear(H, 1)
+        self.refine_gate_max = min(max(float(getattr(config, "refine_gate_max", 1.0)), 0.0), 1.0)
         self._use_boundary_refinement = getattr(config, "use_boundary_refinement", True)
 
         # ---- Saliency projections --------------------------------------
@@ -834,12 +892,18 @@ class GaussianFormer_VMR(nn.Module):
             if self.boundary_refine.learnable_sigma:
                 nn.init.zeros_(self.boundary_refine.sigma_width_scale_start)
                 nn.init.zeros_(self.boundary_refine.sigma_width_scale_end)
-            # Small-normal init for text/query conditioning columns (2H:4H) keeps
-            # semantic inputs active from step 1 without dominating boundary cues.
+            # Small-normal init for geometry/text/query conditioning columns
+            # (4H:7H) keeps semantic inputs active from step 1 without
+            # dominating boundary and boundary-contrast cues.
             with torch.no_grad():
                 _H = self.boundary_refine._H
-                nn.init.normal_(self.boundary_refine.joint_mlp.layers[0].weight[:, 2 * _H:],
+                nn.init.normal_(self.boundary_refine.joint_mlp.layers[0].weight[:, 4 * _H:],
                                 mean=0.0, std=0.01)
+            # Start with a moderate per-boundary update confidence. The raw
+            # delta MLP still decides direction and size, while the confidence
+            # branch learns to suppress ambiguous local evidence.
+            nn.init.zeros_(self.boundary_refine.delta_gate.layers[-1].weight)
+            nn.init.constant_(self.boundary_refine.delta_gate.layers[-1].bias, 1.0)
         # Zero-init caq_ref_head final layer so initial reference-point offsets=0.
         # This means at ep0 CAQ produces the same reference points as the static
         # uniform linspace init, and the offset grows as training progresses.
@@ -1128,7 +1192,7 @@ class GaussianFormer_VMR(nn.Module):
             # gate starts near 0.05 at ep0 (refine_gate.bias=-3.0) and grows as training progresses.
             # This removes unconditional refinement application, preventing the
             # boundary_refine loss-coef ramp from starving the coarse decoder gradient.
-            gate = torch.sigmoid(self.refine_gate(dec_out))         # (B, Q, 1)
+            gate = torch.sigmoid(self.refine_gate(dec_out)) * self.refine_gate_max  # (B, Q, 1)
             pred_spans_final = gate * pred_spans_refined + (1.0 - gate) * pred_spans  # (B, Q, 2)
         else:
             pred_spans_refined = None

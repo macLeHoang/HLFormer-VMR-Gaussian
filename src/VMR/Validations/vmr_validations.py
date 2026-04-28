@@ -13,13 +13,35 @@ import torch
 from VMR.Models.span_utils import span_cxw_to_xx, temporal_iou
 
 
+SPAN_SOURCE_KEYS = {
+    "coarse":   "pred_spans",
+    "refined":  "pred_spans_refined",
+    "final":    "pred_spans_final",
+}
+
+
 # ---------------------------------------------------------------------------
 # Post-processing: model output -> list of prediction dicts
 # ---------------------------------------------------------------------------
 
+def _select_span_tensor(outputs, use_refined_spans=True, span_key=None):
+    """Select a span tensor from model outputs."""
+    if span_key is not None:
+        return outputs.get(span_key)
+
+    if use_refined_spans:
+        for key in ("pred_spans_final", "pred_spans_refined", "pred_spans"):
+            span_tensor = outputs.get(key)
+            if span_tensor is not None:
+                return span_tensor
+        return outputs["pred_spans"]
+
+    return outputs["pred_spans"]
+
+
 def post_process_predictions(outputs, metas, duration_key="duration",
                              top_k=5, nms_thresh=0.4,
-                             use_refined_spans=True):
+                             use_refined_spans=True, span_key=None):
     """Convert raw model outputs to per-sample prediction lists.
 
     Args:
@@ -40,14 +62,9 @@ def post_process_predictions(outputs, metas, duration_key="duration",
     # Inference span selection is independent from matcher/label supervision.
     # When use_refined_spans=True, prefer final spans, then refined spans, then
     # coarse spans as a safe fallback for older checkpoints or disabled refinement.
-    if use_refined_spans:
-        _raw = outputs.get("pred_spans_final")
-        if _raw is None:
-            _raw = outputs.get("pred_spans_refined")
-        if _raw is None:
-            _raw = outputs["pred_spans"]
-    else:
-        _raw = outputs["pred_spans"]
+    _raw = _select_span_tensor(outputs, use_refined_spans=use_refined_spans, span_key=span_key)
+    if _raw is None:
+        return None
     pred_spans  = _raw.detach().cpu()                     # (B, Q, 2) cxw [0,1]
 
     # Quality/ranking score: pred_logits is a single logit per query slot.
@@ -83,6 +100,34 @@ def post_process_predictions(outputs, metas, duration_key="duration",
         })
 
     return predictions
+
+
+def _spans_to_seconds(span_tensor, metas, duration_key="duration"):
+    """Convert normalized cxw spans to seconds for each sample."""
+    spans_xx = span_cxw_to_xx(span_tensor.detach().cpu())
+    spans_sec = spans_xx.clone()
+    for i, meta in enumerate(metas):
+        duration = float(meta.get(duration_key, 1.0))
+        spans_sec[i] = spans_sec[i] * duration
+        spans_sec[i, :, 0] = spans_sec[i, :, 0].clamp(min=0.0, max=duration)
+        spans_sec[i, :, 1] = spans_sec[i, :, 1].clamp(min=0.0, max=duration)
+        spans_sec[i, :, 1] = torch.maximum(
+            spans_sec[i, :, 1], spans_sec[i, :, 0] + 0.01)
+    return spans_sec
+
+
+def _append_span_delta(metrics_acc, src_name, dst_name, src_tensor, dst_tensor, metas):
+    """Accumulate mean absolute start/end deltas between two span sources."""
+    if src_tensor is None or dst_tensor is None:
+        return
+
+    src_sec = _spans_to_seconds(src_tensor, metas)
+    dst_sec = _spans_to_seconds(dst_tensor, metas)
+    deltas = (dst_sec - src_sec).abs()
+    pair_key = f"{src_name}_to_{dst_name}"
+    metrics_acc.setdefault(pair_key, {"start": [], "end": []})
+    metrics_acc[pair_key]["start"].append(deltas[:, :, 0].reshape(-1).numpy())
+    metrics_acc[pair_key]["end"].append(deltas[:, :, 1].reshape(-1).numpy())
 
 
 def temporal_nms(spans, scores, iou_thresh=0.4):
@@ -331,6 +376,8 @@ def evaluate_vmr(model, dataloader, device, cfg):
     top_k           = cfg.get("top_k", 5)
     nms_thresh      = cfg.get("nms_thresh", 0.4)
     use_refined     = cfg.get("use_refined_spans", True)
+    eval_span_source_metrics = cfg.get("eval_span_source_metrics", False)
+    eval_refine_diagnostics  = cfg.get("eval_refine_diagnostics",  False)
 
     all_preds          = []
     all_gt             = []
@@ -338,6 +385,10 @@ def evaluate_vmr(model, dataloader, device, cfg):
     all_saliency_labels = []
     all_vid_masks       = []
     all_gate_means      = []
+    all_gate_values     = []
+    span_source_preds   = {name: [] for name in SPAN_SOURCE_KEYS}
+    span_source_counts  = {name: 0 for name in SPAN_SOURCE_KEYS}
+    span_delta_acc      = {}
 
     for batch_meta, batched_data in dataloader:
         model_inputs, targets = prepare_batch_inputs(batched_data, device)
@@ -351,9 +402,35 @@ def evaluate_vmr(model, dataloader, device, cfg):
         all_preds.extend(preds)
         all_gt.extend(gts)
 
+        if eval_span_source_metrics:
+            for source_name, span_key in SPAN_SOURCE_KEYS.items():
+                source_preds = post_process_predictions(
+                    outputs,
+                    batch_meta,
+                    top_k=top_k,
+                    nms_thresh=nms_thresh,
+                    use_refined_spans=use_refined,
+                    span_key=span_key,
+                )
+                if source_preds is None:
+                    continue
+                span_source_preds[source_name].extend(source_preds)
+                span_source_counts[source_name] += len(source_preds)
+
         gate = outputs.get("pred_refine_gate")
         if gate is not None:
             all_gate_means.append(gate.mean().item())
+            if eval_refine_diagnostics:
+                all_gate_values.append(gate.detach().cpu().reshape(-1).float().numpy())
+
+        if eval_refine_diagnostics:
+            coarse_spans = outputs.get(SPAN_SOURCE_KEYS["coarse"])
+            refined_spans = outputs.get(SPAN_SOURCE_KEYS["refined"])
+            final_spans = outputs.get(SPAN_SOURCE_KEYS["final"])
+            _append_span_delta(span_delta_acc, "coarse", "refined",
+                               coarse_spans, refined_spans, batch_meta)
+            _append_span_delta(span_delta_acc, "coarse", "final",
+                               coarse_spans, final_spans, batch_meta)
 
         if "saliency_all_labels" in batched_data:
             all_saliency_scores.append(outputs["saliency_scores"].cpu())
@@ -364,6 +441,17 @@ def evaluate_vmr(model, dataloader, device, cfg):
     for thr in iou_thresholds:
         metrics[f"R1@{thr}"]  = compute_r1(all_preds, all_gt, iou_thresh=thr)
         metrics[f"mAP@{thr}"] = compute_map(all_preds, all_gt, iou_thresh=thr)
+
+    if eval_span_source_metrics:
+        total_samples = len(all_gt)
+        for source_name, source_preds in span_source_preds.items():
+            if span_source_counts[source_name] != total_samples:
+                continue
+            for thr in iou_thresholds:
+                metrics[f"{source_name}_R1@{thr}"] = compute_r1(
+                    source_preds, all_gt, iou_thresh=thr)
+                metrics[f"{source_name}_mAP@{thr}"] = compute_map(
+                    source_preds, all_gt, iou_thresh=thr)
 
     if all_saliency_scores:
         max_l = max(s.shape[1] for s in all_saliency_scores)
@@ -395,6 +483,21 @@ def evaluate_vmr(model, dataloader, device, cfg):
 
     if all_gate_means:
         metrics["refine_gate_mean"] = sum(all_gate_means) / len(all_gate_means)
+        if eval_refine_diagnostics and all_gate_values:
+            gate_values = np.concatenate(all_gate_values, axis=0)
+            metrics["refine_gate_p25"] = float(np.percentile(gate_values, 25))
+            metrics["refine_gate_p50"] = float(np.percentile(gate_values, 50))
+            metrics["refine_gate_p75"] = float(np.percentile(gate_values, 75))
+            metrics["refine_gate_p90"] = float(np.percentile(gate_values, 90))
+
+    if eval_refine_diagnostics:
+        for pair_key, deltas in span_delta_acc.items():
+            if deltas["start"]:
+                metrics[f"{pair_key}_start_abs_delta_mean_sec"] = float(
+                    np.concatenate(deltas["start"], axis=0).mean())
+            if deltas["end"]:
+                metrics[f"{pair_key}_end_abs_delta_mean_sec"] = float(
+                    np.concatenate(deltas["end"], axis=0).mean())
 
     if hasattr(model.input_vid_proj, "stream_logits"):
         alpha = torch.softmax(model.input_vid_proj.stream_logits, dim=0).tolist()

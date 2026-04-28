@@ -141,3 +141,281 @@ def gpu(data):
     elif isinstance(data, torch.Tensor):
         data = data.contiguous().cuda(non_blocking=True)
     return data
+
+
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+
+def log_metrics(logger, epoch, train_loss, metrics, best_metrics, avg_components=None):
+    logger.info("=" * 80)
+    logger.info(f"Epoch {epoch:3d}  train_loss={train_loss:.4f}")
+    if avg_components:
+        # Log only main-loss keys (skip auxiliary decoder losses like loss_span_0)
+        main = {k: v for k, v in sorted(avg_components.items())
+                if not any(k.endswith(f"_{i}") for i in range(10))}
+        logger.info("  Loss components (epoch avg):")
+        for k, v in main.items():
+            logger.info(f"    {k}: {v:.4f}")
+    if metrics:
+        for k, v in metrics.items():
+            logger.info(f"  {k}: {v:.2f}" if isinstance(v, (int, float)) else f"  {k}: {v}")
+        logger.info("  Best so far:")
+        for k, v in best_metrics.items():
+            logger.info(f"    {k}: {v:.2f}" if isinstance(v, (int, float)) else f"    {k}: {v}")
+    logger.info("=" * 80)
+
+
+def _is_number(value):
+    return isinstance(value, (int, float, np.integer, np.floating))
+
+
+def _format_value(value, digits=2):
+    if isinstance(value, (float, np.floating)):
+        return f"{value:.{digits}f}"
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, list):
+        return "[" + ", ".join(_format_value(v, digits=3) if _is_number(v) else str(v)
+                               for v in value) + "]"
+    return str(value)
+
+
+def _render_table(headers, rows):
+    if not rows:
+        return []
+
+    str_rows = [[str(cell) for cell in row] for row in rows]
+    widths = [len(header) for header in headers]
+    for row in str_rows:
+        for idx, cell in enumerate(row):
+            widths[idx] = max(widths[idx], len(cell))
+
+    def _fmt_row(row):
+        return "  " + " | ".join(cell.ljust(widths[idx]) for idx, cell in enumerate(row))
+
+    separator = "  " + "-+-".join("-" * width for width in widths)
+    lines = [_fmt_row(headers), separator]
+    lines.extend(_fmt_row(row) for row in str_rows)
+    return lines
+
+
+def _log_section(logger, title, lines):
+    if not lines:
+        return
+    logger.info(f"[{title}]")
+    for line in lines:
+        logger.info(line)
+
+
+def _metric_or_dash(metrics, key, digits=2):
+    value = metrics.get(key)
+    return _format_value(value, digits=digits) if value is not None else "-"
+
+
+def _format_loss_section(avg_components):
+    if not avg_components:
+        return []
+    main = {k: v for k, v in sorted(avg_components.items())
+            if not any(k.endswith(f"_{i}") for i in range(10))}
+    rows = [(name, _format_value(value, digits=4)) for name, value in main.items()]
+    return _render_table(["Loss", "Avg"], rows)
+
+
+def _format_main_metrics_section(metrics):
+    if not metrics:
+        return []
+    preferred = [
+        "primary",
+        "R1@0.3", "R1@0.5", "R1@0.7",
+        "mAP@0.3", "mAP@0.5", "mAP@0.7",
+        "hl_mAP", "HIT@1",
+    ]
+    present = [key for key in preferred if key in metrics]
+    if not present:
+        return []
+    return _render_table(present, [[_metric_or_dash(metrics, key) for key in present]])
+
+
+def _format_span_source_section(metrics):
+    rows = []
+    headers = ["Source", "R1@0.3", "R1@0.5", "R1@0.7", "mAP@0.3", "mAP@0.5", "mAP@0.7"]
+    for source in ("coarse", "refined", "final"):
+        if any(f"{source}_{metric}" in metrics for metric in headers[1:]):
+            rows.append([
+                source,
+                _metric_or_dash(metrics, f"{source}_R1@0.3"),
+                _metric_or_dash(metrics, f"{source}_R1@0.5"),
+                _metric_or_dash(metrics, f"{source}_R1@0.7"),
+                _metric_or_dash(metrics, f"{source}_mAP@0.3"),
+                _metric_or_dash(metrics, f"{source}_mAP@0.5"),
+                _metric_or_dash(metrics, f"{source}_mAP@0.7"),
+            ])
+    return _render_table(headers, rows)
+
+
+def _format_refinement_gain_section(metrics):
+    pairs = [
+        ("refined - coarse", "refined", "coarse"),
+        ("final - coarse", "final", "coarse"),
+        ("final - refined", "final", "refined"),
+    ]
+    rows = []
+    for label, lhs, rhs in pairs:
+        r1_lhs = metrics.get(f"{lhs}_R1@0.7")
+        r1_rhs = metrics.get(f"{rhs}_R1@0.7")
+        map_lhs = metrics.get(f"{lhs}_mAP@0.7")
+        map_rhs = metrics.get(f"{rhs}_mAP@0.7")
+        if None in (r1_lhs, r1_rhs, map_lhs, map_rhs):
+            continue
+        rows.append([
+            label,
+            f"{(r1_lhs - r1_rhs):+.2f}",
+            f"{(map_lhs - map_rhs):+.2f}",
+        ])
+    return _render_table(["Delta", "R1@0.7", "mAP@0.7"], rows)
+
+
+def _format_refinement_diagnostics_section(metrics):
+    lines = []
+    gate_rows = []
+    for key in ("refine_gate_mean", "refine_gate_p25", "refine_gate_p50",
+                "refine_gate_p75", "refine_gate_p90"):
+        if key in metrics:
+            gate_rows.append((key, _metric_or_dash(metrics, key, digits=4)))
+    if gate_rows:
+        lines.extend(_render_table(["Gate", "Value"], gate_rows))
+
+    delta_rows = []
+    for pair in ("coarse_to_refined", "coarse_to_final"):
+        start_key = f"{pair}_start_abs_delta_mean_sec"
+        end_key = f"{pair}_end_abs_delta_mean_sec"
+        if start_key in metrics or end_key in metrics:
+            delta_rows.append([
+                pair,
+                _metric_or_dash(metrics, start_key, digits=4),
+                _metric_or_dash(metrics, end_key, digits=4),
+            ])
+    if delta_rows:
+        if lines:
+            lines.append("  ")
+        lines.extend(_render_table(["Transition", "Start d_sec", "End d_sec"], delta_rows))
+    return lines
+
+
+def _build_validation_warnings(metrics, cfg):
+    warnings = []
+
+    gate_cap = cfg.get("refine_gate_max")
+    gate_p50 = metrics.get("refine_gate_p50")
+    gate_p90 = metrics.get("refine_gate_p90")
+    if gate_cap is not None and gate_p50 is not None and gate_p50 >= 0.90 * float(gate_cap):
+        warnings.append(
+            f"refine_gate median is near the configured cap "
+            f"({gate_p50:.4f} / {float(gate_cap):.4f})"
+        )
+    if gate_cap is not None and gate_p90 is not None and gate_p90 >= 0.98 * float(gate_cap):
+        warnings.append(
+            f"refine_gate high-percentile values look saturated "
+            f"(p90={gate_p90:.4f}, cap={float(gate_cap):.4f})"
+        )
+
+    coarse_map_07 = metrics.get("coarse_mAP@0.7")
+    refined_map_07 = metrics.get("refined_mAP@0.7")
+    if coarse_map_07 is not None and refined_map_07 is not None and refined_map_07 < coarse_map_07:
+        warnings.append(
+            f"refined mAP@0.7 is below coarse "
+            f"({refined_map_07:.2f} vs {coarse_map_07:.2f})"
+        )
+
+    final_r1_07 = metrics.get("final_R1@0.7")
+    refined_r1_07 = metrics.get("refined_R1@0.7")
+    if final_r1_07 is not None and refined_r1_07 is not None and final_r1_07 < refined_r1_07:
+        warnings.append(
+            f"final R1@0.7 is below refined "
+            f"({final_r1_07:.2f} vs {refined_r1_07:.2f})"
+        )
+
+    final_map_07 = metrics.get("final_mAP@0.7")
+    if final_map_07 is not None and refined_map_07 is not None and final_map_07 < refined_map_07:
+        warnings.append(
+            f"final mAP@0.7 is below refined "
+            f"({final_map_07:.2f} vs {refined_map_07:.2f})"
+        )
+
+    return warnings
+
+
+def _format_best_section(best_metrics, state=None):
+    if not best_metrics:
+        return []
+    row = [[
+        _metric_or_dash(best_metrics, "primary"),
+        _metric_or_dash(best_metrics, "R1@0.5"),
+        _metric_or_dash(best_metrics, "R1@0.7"),
+        _metric_or_dash(best_metrics, "mAP@0.5"),
+        _metric_or_dash(best_metrics, "mAP@0.7"),
+        _metric_or_dash(best_metrics, "hl_mAP"),
+    ]]
+    lines = _render_table(["primary", "R1@0.5", "R1@0.7", "mAP@0.5", "mAP@0.7", "hl_mAP"], row)
+    source_lines = _format_span_source_section(best_metrics)
+    if source_lines:
+        lines.append("  ")
+        lines.append("  Span source metrics:")
+        lines.extend(source_lines)
+    if state:
+        status = "updated" if state.get("best_updated") else "unchanged"
+        lines.append(
+            f"  best.ckpt: {status}"
+            + (f" | {state['best_ckpt_path']}" if state.get("best_ckpt_path") else "")
+        )
+    return lines
+
+
+def _format_training_state_section(epoch, train_loss, state):
+    rows = [
+        ("epoch", epoch),
+        ("train_loss", _format_value(train_loss, digits=4)),
+        ("validated", "yes" if state.get("validated") else "no"),
+        ("ema_eval", "yes" if state.get("ema_active") else "no"),
+    ]
+    if state.get("validated"):
+        rows.append(("best_updated", "yes" if state.get("best_updated") else "no"))
+    if state.get("early_stop_counter") is not None:
+        max_es = state.get("max_es_cnt")
+        rows.append(("early_stop", f"{state['early_stop_counter']}/{max_es}"))
+    if state.get("learning_rates"):
+        lr_text = ", ".join(f"{lr:.2e}" for lr in state["learning_rates"])
+        rows.append(("lr", lr_text))
+    if state.get("latest_ckpt_path"):
+        rows.append(("last_ckpt", state["latest_ckpt_path"]))
+    if state.get("early_stop_triggered"):
+        rows.append(("stop", "early_stop"))
+    return _render_table(["State", "Value"], rows)
+
+
+def log_validation_summary(logger, epoch, train_loss, metrics, best_metrics, cfg,
+                           avg_components=None, state=None, title_prefix="Epoch"):
+    state = state or {}
+    logger.info("=" * 80)
+    logger.info(f"{title_prefix} {epoch:3d} validation summary")
+
+    _log_section(logger, "Losses", _format_loss_section(avg_components))
+
+    if metrics:
+        _log_section(logger, "Main Metrics", _format_main_metrics_section(metrics))
+        _log_section(logger, "Span Source Metrics", _format_span_source_section(metrics))
+        _log_section(logger, "Refinement Diagnostics", _format_refinement_diagnostics_section(metrics))
+        _log_section(logger, "Refinement Gain", _format_refinement_gain_section(metrics))
+
+        for warning in _build_validation_warnings(metrics, cfg):
+            logger.warning(f"[Validation Warning] {warning}")
+
+    _log_section(logger, "Best So Far", _format_best_section(best_metrics, state=state))
+    _log_section(logger, "Training State", _format_training_state_section(epoch, train_loss, state))
+
+    if metrics and cfg.get("log_raw_val_metrics", False):
+        raw_rows = [(key, _format_value(value, digits=4)) for key, value in sorted(metrics.items())]
+        _log_section(logger, "Raw Metric Dump", _render_table(["Metric", "Value"], raw_rows))
+
+    logger.info("=" * 80)

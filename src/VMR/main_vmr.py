@@ -40,7 +40,7 @@ from VMR.Losses.vmr_loss           import build_criterion
 from VMR.Validations.vmr_validations import evaluate_vmr
 
 from Utils.basic_utils import AverageMeter
-from Utils.utils import set_seed, set_log, save_ckpt, load_ckpt
+from Utils.utils import set_seed, set_log, save_ckpt, load_ckpt, log_validation_summary
 
 
 # ---------------------------------------------------------------------------
@@ -437,29 +437,6 @@ def val_one_epoch(epoch, val_loader, model, cfg, device, logger):
 
 
 # ---------------------------------------------------------------------------
-# Logging helpers
-# ---------------------------------------------------------------------------
-
-def log_metrics(logger, epoch, train_loss, metrics, best_metrics, avg_components=None):
-    logger.info("=" * 80)
-    logger.info(f"Epoch {epoch:3d}  train_loss={train_loss:.4f}")
-    if avg_components:
-        # Log only main-loss keys (skip auxiliary decoder losses like loss_span_0)
-        main = {k: v for k, v in sorted(avg_components.items())
-                if not any(k.endswith(f"_{i}") for i in range(10))}
-        logger.info("  Loss components (epoch avg):")
-        for k, v in main.items():
-            logger.info(f"    {k}: {v:.4f}")
-    if metrics:
-        for k, v in metrics.items():
-            logger.info(f"  {k}: {v:.2f}" if isinstance(v, (int, float)) else f"  {k}: {v}")
-        logger.info("  Best so far:")
-        for k, v in best_metrics.items():
-            logger.info(f"    {k}: {v:.2f}" if isinstance(v, (int, float)) else f"    {k}: {v}")
-    logger.info("=" * 80)
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -549,9 +526,23 @@ def main():
             logger.warning("--eval specified but no --resume checkpoint provided!")
         loader = test_loader if test_loader is not None else val_loader
         metrics = val_one_epoch(-1, loader, model, cfg, device, logger)
-        logger.info("Evaluation results:")
-        for k, v in metrics.items():
-            logger.info(f"  {k}: {v:.2f}")
+        eval_state = {
+            "validated": True,
+            "ema_active": False,
+            "best_updated": False,
+            "best_ckpt_path": args.resume or None,
+        }
+        log_validation_summary(
+            logger,
+            epoch=-1,
+            train_loss=float("nan"),
+            metrics=metrics,
+            best_metrics=metrics,
+            cfg=cfg,
+            avg_components=None,
+            state=eval_state,
+            title_prefix="Eval",
+        )
         return
 
     # ---------- Training loop -------------------------------------------------
@@ -596,29 +587,51 @@ def main():
             with torch.no_grad():
                 metrics = val_one_epoch(epoch, val_loader, eval_model, cfg, device, logger)
 
-        log_metrics(logger, epoch, train_loss, metrics if do_validate else None,
-                    best_metrics, avg_components=loss_components)
-
         # --- Checkpoint & early stopping ---
         raw_model = model.module if isinstance(model, nn.DataParallel) else model
+        best_ckpt_path = os.path.join(cfg["model_root"], "best.ckpt")
+        latest_ckpt_path = os.path.join(cfg["model_root"], "last.pt")
+        best_updated = False
+        stop_training = False
 
         if do_validate:
             primary = metrics.get("primary", 0.0)
             if primary > best_metrics.get("primary", 0.0):
                 best_metrics = metrics
+                best_updated = True
                 es_cnt = 0
-                ckpt_path = os.path.join(cfg["model_root"], "best.ckpt")
                 # Save EMA model as the checkpoint when available (better generalization)
                 save_model = ema.module if ema is not None else raw_model
-                save_ckpt(save_model, optimizer, scheduler, cfg, ckpt_path, epoch, best_metrics)
-                logger.info(f"  New best checkpoint saved -> {ckpt_path}"
-                            + (" (EMA)" if ema is not None else ""))
+                save_ckpt(save_model, optimizer, scheduler, cfg, best_ckpt_path, epoch, best_metrics)
             else:
                 es_cnt += 1
-                logger.info(f"  No improvement ({es_cnt}/{cfg['max_es_cnt']})")
                 if cfg["max_es_cnt"] != -1 and es_cnt > cfg["max_es_cnt"]:
-                    logger.info("Early stopping triggered.")
-                    break
+                    stop_training = True
+
+        state = {
+            "validated": do_validate,
+            "ema_active": ema is not None,
+            "best_updated": best_updated,
+            "best_ckpt_path": best_ckpt_path if os.path.exists(best_ckpt_path) or best_updated else None,
+            "early_stop_counter": es_cnt,
+            "max_es_cnt": cfg["max_es_cnt"],
+            "learning_rates": [group["lr"] for group in optimizer.param_groups],
+            "early_stop_triggered": stop_training,
+        }
+
+        if stop_training:
+            log_validation_summary(
+                logger,
+                epoch,
+                train_loss,
+                metrics if do_validate else None,
+                best_metrics,
+                cfg,
+                avg_components=loss_components,
+                state=state,
+            )
+            logger.info("Early stopping triggered.")
+            break
 
         # --- Separate saliency checkpoint (hl_mAP) ---
         # hl_map = metrics.get("hl_mAP", 0.0)
@@ -631,7 +644,6 @@ def main():
         #                 f"(hl_mAP={hl_map:.2f})")
 
         # --- Latest checkpoint: raw model + EMA (always overwritten) ---
-        last_path = os.path.join(cfg["model_root"], "last.pt")
         last_ckpt = {
             "config":     cfg,
             "epoch":      epoch,
@@ -642,9 +654,19 @@ def main():
         }
         if ema is not None:
             last_ckpt["ema_state_dict"] = ema.state_dict()
-        torch.save(last_ckpt, last_path)
-        logger.info(f"  Latest checkpoint saved -> {last_path}"
-                    + (" (raw + EMA)" if ema is not None else " (raw)"))
+        torch.save(last_ckpt, latest_ckpt_path)
+
+        state["latest_ckpt_path"] = latest_ckpt_path
+        log_validation_summary(
+            logger,
+            epoch,
+            train_loss,
+            metrics if do_validate else None,
+            best_metrics,
+            cfg,
+            avg_components=loss_components,
+            state=state,
+        )
 
     # ---------- Final test evaluation ----------------------------------------
     if test_loader is not None:
@@ -660,9 +682,23 @@ def main():
                 logger.info(f"  Unexpected keys (ignored): {_info.unexpected_keys}")
 
         test_metrics = val_one_epoch(-1, test_loader, model, cfg, device, logger)
-        logger.info("Test results:")
-        for k, v in test_metrics.items():
-            logger.info(f"  {k}: {v:.2f}")
+        test_state = {
+            "validated": True,
+            "ema_active": False,
+            "best_updated": False,
+            "best_ckpt_path": best_ckpt if os.path.exists(best_ckpt) else None,
+        }
+        log_validation_summary(
+            logger,
+            epoch=-1,
+            train_loss=float("nan"),
+            metrics=test_metrics,
+            best_metrics=test_metrics,
+            cfg=cfg,
+            avg_components=None,
+            state=test_state,
+            title_prefix="Test",
+        )
 
 
 if __name__ == "__main__":

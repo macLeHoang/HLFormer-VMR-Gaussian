@@ -321,6 +321,8 @@ class VMRDataset(Dataset):
         final_ctx_lengths = []
         durations = []
         aligned_clip_lens = []
+        stream_length_spreads = []
+        stream_length_spread_bins = {"0": 0, "1": 0, "2": 0, "3-5": 0, "6+": 0}
         stream_length_mismatch_count = 0
         cfg_clip_len_mismatch_count = 0
         clamp_count = 0
@@ -346,6 +348,18 @@ class VMRDataset(Dataset):
 
                 if len(set(stream_lengths)) > 1:
                     stream_length_mismatch_count += 1
+                spread = max(stream_lengths) - min(stream_lengths)
+                stream_length_spreads.append(spread)
+                if spread == 0:
+                    stream_length_spread_bins["0"] += 1
+                elif spread == 1:
+                    stream_length_spread_bins["1"] += 1
+                elif spread == 2:
+                    stream_length_spread_bins["2"] += 1
+                elif spread <= 5:
+                    stream_length_spread_bins["3-5"] += 1
+                else:
+                    stream_length_spread_bins["6+"] += 1
 
                 if self.clip_len > 0:
                     rel_err = abs(aligned_clip_len - self.clip_len) / max(self.clip_len, 1e-6)
@@ -375,6 +389,9 @@ class VMRDataset(Dataset):
             "ctx_l_mean": mean(final_ctx_lengths) if final_ctx_lengths else 0.0,
             "duration_mean": mean(durations) if durations else 0.0,
             "aligned_clip_len_mean": mean(aligned_clip_lens) if aligned_clip_lens else 0.0,
+            "stream_length_spread_mean": mean(stream_length_spreads) if stream_length_spreads else 0.0,
+            "stream_length_spread_max": max(stream_length_spreads) if stream_length_spreads else 0,
+            "stream_length_spread_bins": stream_length_spread_bins,
         }
         for i, vals in enumerate(raw_lengths_per_stream):
             summary[f"stream{i}_raw_len_mean"] = mean(vals) if vals else 0.0
