@@ -439,6 +439,7 @@ class MultiStreamVidProjection(nn.Module):
                          for proj, s in zip(self.stream_projs, streams)]
         else:
             projected = [proj(s) for proj, s in zip(self.stream_projs, streams)]
+
         if len(projected) > 1:
             stacked = torch.stack(projected, dim=2)
             gate_logits = self.stream_gate(stacked).squeeze(-1) + self.stream_logits.view(1, 1, -1)

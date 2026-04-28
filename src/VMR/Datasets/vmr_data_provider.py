@@ -148,8 +148,8 @@ class VMRDataset(Dataset):
         self.normalize_t      = normalize_t
         self.load_labels      = load_labels
         self.txt_drop_ratio   = txt_drop_ratio
-        assert v_feat_len_mode in ("max", "min"), \
-            f"v_feat_len_mode must be 'max' or 'min', got '{v_feat_len_mode}'"
+        assert v_feat_len_mode in ("max", "min", "time_grid"), \
+            f"v_feat_len_mode must be 'max', 'min', or 'time_grid', got '{v_feat_len_mode}'"
         self.v_feat_len_mode  = v_feat_len_mode
         assert q_feat_len_mode in ("max", "min"), \
             f"q_feat_len_mode must be 'max' or 'min', got '{q_feat_len_mode}'"
@@ -185,7 +185,7 @@ class VMRDataset(Dataset):
 
         model_inputs = {}
         model_inputs["query_feat"] = self._get_query_feat(meta["qid"])   # (L_q, D_q)
-        model_inputs["video_feat"] = self._get_video_feat(meta["vid"])   # (L_v, D_v)
+        model_inputs["video_feat"] = self._get_video_feat(meta["vid"], float(meta["duration"]))   # (L_v, D_v)
         orig_ctx_l = len(model_inputs["video_feat"])                     # #clips before crop
         ctx_l = orig_ctx_l
         orig_duration = float(meta["duration"])
@@ -286,20 +286,32 @@ class VMRDataset(Dataset):
 
         return torch.from_numpy(feat)   # (L_q, D_q)
 
-    def _get_video_feat(self, vid):
+    def _get_video_feat(self, vid, duration):
         feat_list = []
         raw_lengths = []
+        time_centers = []
 
         for feat_dir in self.v_feat_dirs:
             path = join(feat_dir, f"{vid}.npz")
-            feat = np.load(path)["features"].astype(np.float32)
+            feat_npz = np.load(path)
+            feat = feat_npz["features"].astype(np.float32)
             raw_lengths.append(len(feat))
             feat_list.append(feat)
+            time_centers.append(self._get_stream_time_centers(feat_npz, len(feat), duration))
 
-        target_len = self._aligned_video_length_from_lengths(raw_lengths)
-        target_len = min(target_len, self.max_v_l)
+        if self.v_feat_len_mode == "time_grid":
+            target_len = self._canonical_video_length(duration, fallback_lengths=raw_lengths)
+            target_t = self._uniform_time_centers(target_len, duration)
+            feat_list = [
+                self._resample_by_time(src_feat, src_t, target_t)
+                for src_feat, src_t in zip(feat_list, time_centers)
+            ]
+        else:
+            target_len = self._aligned_video_length_from_lengths(raw_lengths)
+            target_len = min(target_len, self.max_v_l)
+            feat_list = [resample_feat(f, target_len) for f in feat_list]
 
-        feat_list = [resample_feat(f, target_len) for f in feat_list]
+        target_len = max(int(target_len), 1)
 
         if self.normalize_v:
             feat_list = [l2_normalize_np_array(f) for f in feat_list]
@@ -311,6 +323,52 @@ class VMRDataset(Dataset):
         if not lengths:
             return 0
         return max(lengths) if self.v_feat_len_mode == "max" else min(lengths)
+
+    def _canonical_video_length(self, duration, fallback_lengths=None):
+        if self.clip_len > 0:
+            length = int(round(max(float(duration), 0.0) / self.clip_len))
+            length = min(length, int(self.max_v_l))
+            return max(length, 1)
+        if fallback_lengths:
+            return max(min(max(fallback_lengths), self.max_v_l), 1)
+        return 1
+
+    @staticmethod
+    def _uniform_time_centers(length, duration):
+        if length <= 0:
+            return np.zeros((0,), dtype=np.float32)
+        duration = max(float(duration), 1e-6)
+        return ((np.arange(length, dtype=np.float32) + 0.5) / float(length)) * duration
+
+    def _get_stream_time_centers(self, feat_npz, feat_len, duration):
+        if feat_len <= 0:
+            return np.zeros((0,), dtype=np.float32)
+        if "timestamps" in feat_npz:
+            ts = np.asarray(feat_npz["timestamps"], dtype=np.float32)
+            if ts.ndim == 2 and ts.shape[1] >= 2:
+                centers = 0.5 * (ts[:, 0] + ts[:, 1])
+            else:
+                centers = ts.reshape(-1)
+            if len(centers) == feat_len:
+                return np.clip(centers, 0.0, max(float(duration), 1e-6))
+        return self._uniform_time_centers(feat_len, duration)
+
+    @staticmethod
+    def _resample_by_time(feat, src_t, target_t):
+        if len(feat) == 0:
+            return np.zeros((len(target_t), feat.shape[1]), dtype=np.float32)
+        if len(feat) == len(target_t) and np.allclose(src_t, target_t):
+            return feat
+        if len(feat) == 1:
+            return np.repeat(feat, len(target_t), axis=0)
+        src_t = np.asarray(src_t, dtype=np.float32)
+        target_t = np.asarray(target_t, dtype=np.float32)
+        src_t = np.maximum.accumulate(src_t)
+        src_t = src_t + np.linspace(0.0, 1e-6, num=len(src_t), dtype=np.float32)
+        out = np.empty((len(target_t), feat.shape[1]), dtype=np.float32)
+        for d in range(feat.shape[1]):
+            out[:, d] = np.interp(target_t, src_t, feat[:, d], left=feat[0, d], right=feat[-1, d])
+        return out
 
     def summarize_temporal_alignment(self, max_samples=None):
         samples = self.data if max_samples is None else self.data[:max_samples]
@@ -334,12 +392,16 @@ class VMRDataset(Dataset):
                 for stream_idx, feat_dir in enumerate(self.v_feat_dirs):
                     path = join(feat_dir, f"{meta['vid']}.npz")
                     feat = np.load(path)["features"]
-                    raw_len = int(min(len(feat), self.max_v_l))
+                    raw_len = int(len(feat))
                     raw_lengths_per_stream[stream_idx].append(raw_len)
                     stream_lengths.append(raw_len)
 
-                ctx_l = self._aligned_video_length_from_lengths(stream_lengths)
                 duration = float(meta.get("duration", 0.0))
+                if self.v_feat_len_mode == "time_grid":
+                    ctx_l = self._canonical_video_length(duration, fallback_lengths=stream_lengths)
+                else:
+                    ctx_l = self._aligned_video_length_from_lengths(stream_lengths)
+                    ctx_l = min(ctx_l, self.max_v_l)
                 aligned_clip_len = duration / max(ctx_l, 1)
 
                 final_ctx_lengths.append(ctx_l)
@@ -380,6 +442,7 @@ class VMRDataset(Dataset):
         summary = {
             "samples": len(samples),
             "load_failures": load_failures,
+            "v_feat_len_mode": self.v_feat_len_mode,
             "stream_length_mismatch_count": stream_length_mismatch_count,
             "stream_length_mismatch_ratio": stream_length_mismatch_count / max(len(samples), 1),
             "cfg_clip_len_mismatch_count": cfg_clip_len_mismatch_count,

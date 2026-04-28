@@ -14,7 +14,7 @@ cfg = dict(_qvh.cfg)
 
 cfg["seed"]         = 36
 
-cfg["model_name"]   = "GaussianFormer_VMR_v22"
+cfg["model_name"]   = "GaussianFormer_VMR_v23"
 cfg["dataset_name"] = "charades_sta"
 cfg["dset_name"]    = "charades_sta"
 
@@ -48,11 +48,11 @@ cfg["n_input_proj"]                    = 2
 cfg["max_v_l"]                         = 75
 cfg["clip_len"]                        = 1.0
 cfg["use_tef"]                         = True
-cfg["v_feat_len_mode"]                 = "max"  # Options: max | min. Keep the longest stream so valid frames are not clipped.
+cfg["v_feat_len_mode"]                 = "time_grid"  # Options: time_grid | max | min. time_grid uses duration/clip_len canonical alignment.
 
 # ---- Model architecture --------------------------------------------------
 cfg["hidden_size"]               = 384
-cfg["n_heads"]                   = 8
+cfg["n_heads"]                   = 6
 cfg["num_queries"]               = 6            # Stage-3 ablation: try 6 for lower ranking noise on single-moment data.
 cfg["dec_layers"]                = 3
 cfg["input_drop"]                = 0.25
@@ -74,15 +74,15 @@ cfg["use_global_in_encoder"]     = True
 cfg["use_boundary_refinement"]   = True
 cfg["refine_gate_max"]           = 0.85
 
-cfg["use_refined_spans"]         = True  # Prefer refined spans at evaluation when available.
-
 # Matcher supervision, label supervision, and inference span selection are related but separate:
 # - match_span_source selects the spans used in matching cost.
 # - label_span_source selects the spans used for soft IoU targets.
 # - use_refined_spans controls validation-time span preference.
-cfg["match_span_source"]         = "coarse"  # Options: coarse | refined | dual. Match on coarse spans to keep early training stable.
-cfg["refined_cost_weight"]       = 0.0       # Weight for refined-span cost when match_span_source="dual".
-cfg["label_span_source"]         = "refined"   # Options: coarse | refined | matched | final.
+cfg["match_span_source"]         = "coarse"     # Options: coarse | refined | dual. Match on coarse spans to keep early training stable.
+cfg["refined_cost_weight"]       = 0.0          # Weight for refined-span cost when match_span_source="dual".
+cfg["label_span_source"]         = "refined"    # Options: coarse | refined | matched | final.
+
+cfg["use_refined_spans"]         = True  # Prefer refined spans at evaluation when available.
 
 # ---- Contrastive alignment -----------------------------------------------
 cfg["contrastive_hdim"]            = 64
@@ -126,10 +126,10 @@ cfg["top_k"]      = 6     # Keep one candidate per query.
 cfg["nms_thresh"] = 0.45  # Slightly tighter NMS suits short Charades moments.
 
 # ---- Optimizer -----------------------------------------------------------
-cfg["lr"]                   = 1.25e-4
-cfg["lr_vid_enc"]           = 0.625e-4
-cfg["lr_refiner"]           = 1.25e-4      # Give the refinement head enough learning signal.
-cfg["lr_txt_enc"]           = 0.625e-4
+cfg["lr"]                   = 1.5e-4
+cfg["lr_vid_enc"]           = 0.75e-4
+cfg["lr_refiner"]           = 1.5e-4      # Give the refinement head enough learning signal.
+cfg["lr_txt_enc"]           = 0.75e-4
 cfg["lr_drop"]              = 25        # Step decay after warmup at epoch 30; aligns with the observed validation peak.
 cfg["lr_gamma"]             = 0.5       # Legacy field kept for compatibility.
 cfg["warmup_epochs"]        = 5
@@ -159,16 +159,16 @@ cfg["feat_noise_std"]      = 0.00
 cfg["aug_schedule"] = [
     (0,  {"temporal_crop_ratio": 0.2, "feat_mask_ratio": 0.15, "gt_jitter_frames": 2}),
     (20, {"temporal_crop_ratio": 0.2, "feat_mask_ratio": 0.10, "gt_jitter_frames": 1}),
-    (30, {"temporal_crop_ratio": 0.1, "feat_mask_ratio": 0.05, "gt_jitter_frames": 1}),
+    (30, {"temporal_crop_ratio": 0.1, "feat_mask_ratio": 0.10, "gt_jitter_frames": 1}),
 ]
 
 cfg["iou_thresholds"] = [0.3, 0.5, 0.7]
 
 # ---- Validation schedule -------------------------------------------------
-cfg["val_freq"]                 = 3
+cfg["val_freq"]                 = 5
 cfg["val_full_epoch"]           = 20         # Run full validation from this epoch onward.
 cfg["eval_span_source_metrics"] = True       # Report coarse/refined/final validation metrics without changing primary.
-cfg["eval_refine_diagnostics"]  = True      # Report gate percentiles and boundary-delta diagnostics.
+cfg["eval_refine_diagnostics"]  = False      # Report gate percentiles and boundary-delta diagnostics.
 
 # ---- Loss schedule -------------------------------------------------------
 # Each entry is (from_epoch, {cfg_key: new_value, ...}).
