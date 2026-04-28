@@ -14,7 +14,7 @@ cfg = dict(_qvh.cfg)
 
 cfg["seed"]         = 36
 
-cfg["model_name"]   = "GaussianFormer_VMR_v16"
+cfg["model_name"]   = "GaussianFormer_VMR_v20_query_refine_final_label"
 cfg["dataset_name"] = "charades_sta"
 cfg["dset_name"]    = "charades_sta"
 
@@ -171,7 +171,7 @@ cfg["val_full_epoch"] = 10  # Run full validation from this epoch onward.
 # Each entry is (from_epoch, {cfg_key: new_value, ...}).
 # main_vmr.py applies these updates to criterion weights and matcher costs.
 cfg["loss_schedule"] = [
-    # Phase 0 (ep 0-4): cold start — refiner hot from start
+    # Phase 0 (ep 0-4): cold start — moderate refinement while coarse spans stabilise
     (0,  {
         'span_loss_coef':               10.0,
         'giou_loss_coef':               6.0,

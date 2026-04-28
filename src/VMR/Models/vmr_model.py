@@ -504,10 +504,10 @@ class BoundaryRefinementHead(nn.Module):
         # Text-conditioned sigma offset: maps global cross-modal rep → 2 scalars
         # (one per boundary).  Zero-init → text starts contributing nothing.
         self.sigma_txt_proj = nn.Linear(H, 2, bias=True)
-        # Joint MLP: takes concatenated (start_feat, end_feat, txt_rep) → (delta_s, delta_e).
-        # Text context lets the MLP decide *which direction* to shift based on query semantics.
-        # txt_rep defaults to zeros when not provided (backward-compat with old call sites).
-        self.joint_mlp = MLP(3 * H, H, 2, 2)
+        # Joint MLP: takes concatenated (start_feat, end_feat, txt_rep, query_feat)
+        # → (delta_s, delta_e). Text and decoder-query context let the MLP decide
+        # *which direction* to shift based on query semantics and slot content.
+        self.joint_mlp = MLP(4 * H, H, 2, 2)
 
     def forward(
         self,
@@ -515,6 +515,7 @@ class BoundaryRefinementHead(nn.Module):
         vid_feat:   torch.Tensor,          # (B, L, H)
         vid_mask:   torch.Tensor,          # (B, L)     1=valid
         txt_rep:    torch.Tensor = None,   # (B, H)     cross-modal global rep (optional)
+        query_feat: torch.Tensor = None,   # (B, Q, H)  decoder query features
     ):                                     # -> (Tensor(B,Q,2), list[Tensor(B,Q,2)])
         B, Q, _ = pred_spans.shape
         L, H    = vid_feat.shape[1], vid_feat.shape[2]
@@ -537,6 +538,9 @@ class BoundaryRefinementHead(nn.Module):
         else:
             txt_off_s = txt_off_e = torch.zeros(B, 1, device=dev, dtype=vid_feat.dtype)
             txt_expand = torch.zeros(B, Q, H, device=dev, dtype=vid_feat.dtype)
+
+        if query_feat is None:
+            query_feat = torch.zeros(B, Q, H, device=dev, dtype=vid_feat.dtype)
 
         def _pool(anchor, sigma):
             # anchor: (B, Q), sigma: (B, Q), returns (B, Q, H)
@@ -566,8 +570,8 @@ class BoundaryRefinementHead(nn.Module):
             end_feat   = _pool(end,   sigma_e)                 # (B, Q, H)
 
             # Joint prediction: start and end deltas conditioned on both
-            # boundaries + text.  Shared weights across passes.
-            joint_feat = torch.cat([start_feat, end_feat, txt_expand], dim=-1)  # (B, Q, 3H)
+            # boundaries + text + decoder query content. Shared weights across passes.
+            joint_feat = torch.cat([start_feat, end_feat, txt_expand, query_feat], dim=-1)  # (B, Q, 4H)
             deltas     = torch.tanh(self.joint_mlp(joint_feat)) * self.max_delta  # (B, Q, 2)
             delta_s    = deltas[..., 0]                        # (B, Q)
             delta_e    = deltas[..., 1]                        # (B, Q)
@@ -775,7 +779,7 @@ class GaussianFormer_VMR(nn.Module):
         # ---- Prediction heads ------------------------------------------
         self.class_head  = nn.Linear(H, 1)   # single per-query quality/ranking logit
         # Gate that learns per-query when to trust boundary refinement vs coarse spans.
-        # Bias=-1.0 so initial gate≈0.27 — refinement contributes but doesn't dominate at ep0.
+        # Bias=-3.0 so initial gate≈0.05 — refinement starts conservatively at ep0.
         self.refine_gate = nn.Linear(H, 1)
         self._use_boundary_refinement = getattr(config, "use_boundary_refinement", True)
 
@@ -830,10 +834,8 @@ class GaussianFormer_VMR(nn.Module):
             if self.boundary_refine.learnable_sigma:
                 nn.init.zeros_(self.boundary_refine.sigma_width_scale_start)
                 nn.init.zeros_(self.boundary_refine.sigma_width_scale_end)
-            # Small-normal init for text portion of joint_mlp first layer (columns 2H:3H).
-            # Was zero-init: text input was stuck behind a zero floor and required large
-            # gradients to activate. std=0.01 lets text inform refinement from step 1
-            # while staying small enough that it doesn't corrupt the ep0 boundary estimate.
+            # Small-normal init for text/query conditioning columns (2H:4H) keeps
+            # semantic inputs active from step 1 without dominating boundary cues.
             with torch.no_grad():
                 _H = self.boundary_refine._H
                 nn.init.normal_(self.boundary_refine.joint_mlp.layers[0].weight[:, 2 * _H:],
@@ -855,7 +857,7 @@ class GaussianFormer_VMR(nn.Module):
         nn.init.zeros_(self.caq_attn.out_proj.bias)
         # Initialize refine_gate conservatively and deterministically.
         nn.init.zeros_(self.refine_gate.weight)
-        nn.init.constant_(self.refine_gate.bias, -2.0)
+        nn.init.constant_(self.refine_gate.bias, -3.0)
         # Spread decoder query reference points uniformly: cx in [0.1, 0.9], w = 0.3
         # sigmoid(query_embed.weight) is used as the initial reference point in _decode,
         # so we store inv_sigmoid of the desired initial values.
@@ -1119,10 +1121,11 @@ class GaussianFormer_VMR(nn.Module):
         if self._use_boundary_refinement:
             pred_spans_refined, refined_passes = self.boundary_refine(
                 pred_spans, vid_feat, src_vid_mask,
-                txt_rep=global_rep)                               # (B, Q, 2)
+                txt_rep=global_rep,
+                query_feat=dec_out)                               # (B, Q, 2)
 
             # ---- 5c. Learned gate: blend coarse and refined spans --------
-            # gate starts near 0.12 at ep0 (refine_gate.bias=-2.0) and grows as training progresses.
+            # gate starts near 0.05 at ep0 (refine_gate.bias=-3.0) and grows as training progresses.
             # This removes unconditional refinement application, preventing the
             # boundary_refine loss-coef ramp from starving the coarse decoder gradient.
             gate = torch.sigmoid(self.refine_gate(dec_out))         # (B, Q, 1)
