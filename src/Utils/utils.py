@@ -276,6 +276,26 @@ def _format_refinement_gain_section(metrics):
     return _render_table(["Delta", "R1@0.7", "mAP@0.7"], rows)
 
 
+def _format_stream_weight_section(metrics):
+    rows = []
+    for key, label in (
+        ("stream_weights", "stream_weights"),
+        ("last_stream_weights", "last_stream_weights"),
+        ("hybrid_blend_mean", "hybrid_blend_mean"),
+    ):
+        values = metrics.get(key)
+        if values is None:
+            continue
+        if isinstance(values, (list, tuple)):
+            value_text = "[" + ", ".join(f"{float(v):.3f}" for v in values) + "]"
+        elif isinstance(values, (float, int)):
+            value_text = f"{float(values):.4f}"
+        else:
+            value_text = str(values)
+        rows.append((label, value_text))
+    return _render_table(["Stream", "Value"], rows)
+
+
 def _format_refinement_diagnostics_section(metrics):
     lines = []
     gate_rows = []
@@ -300,6 +320,11 @@ def _format_refinement_diagnostics_section(metrics):
         if lines:
             lines.append("  ")
         lines.extend(_render_table(["Transition", "Start d_sec", "End d_sec"], delta_rows))
+    stream_rows = _format_stream_weight_section(metrics)
+    if stream_rows:
+        if lines:
+            lines.append("  ")
+        lines.extend(stream_rows)
     return lines
 
 
@@ -363,6 +388,11 @@ def _format_best_section(best_metrics, state=None):
         lines.append("  ")
         lines.append("  Span source metrics:")
         lines.extend(source_lines)
+    stream_lines = _format_stream_weight_section(best_metrics)
+    if stream_lines:
+        lines.append("  ")
+        lines.append("  Stream fusion:")
+        lines.extend(stream_lines)
     if state:
         status = "updated" if state.get("best_updated") else "unchanged"
         lines.append(

@@ -499,11 +499,18 @@ def evaluate_vmr(model, dataloader, device, cfg):
                 metrics[f"{pair_key}_end_abs_delta_mean_sec"] = float(
                     np.concatenate(deltas["end"], axis=0).mean())
 
-    if hasattr(model.input_vid_proj, "stream_logits"):
-        alpha = torch.softmax(model.input_vid_proj.stream_logits, dim=0).tolist()
+    raw_model = model.module if hasattr(model, "module") else model
+    vid_proj = getattr(raw_model, "input_vid_proj", None)
+    if hasattr(vid_proj, "stream_logits"):
+        alpha = torch.softmax(vid_proj.stream_logits, dim=0).tolist()
         metrics["stream_weights"] = [round(a, 3) for a in alpha]
-    if hasattr(model.input_vid_proj, "stream_logits"):
-        alpha = torch.softmax(model.input_vid_proj.last_stream_weights, dim=0).tolist()
-        metrics["last_stream_weights"] = [round(a, 3) for a in alpha]
+        last_alpha = getattr(vid_proj, "last_stream_weights", None)
+        if last_alpha is not None:
+            metrics["last_stream_weights"] = [
+                round(float(a), 3) for a in last_alpha.detach().cpu().tolist()
+            ]
+        last_blend = getattr(vid_proj, "last_hybrid_blend_mean", None)
+        if last_blend is not None:
+            metrics["hybrid_blend_mean"] = round(float(last_blend.detach().cpu().item()), 4)
 
     return metrics

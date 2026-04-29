@@ -354,18 +354,20 @@ class VMRDecoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Multi-stream video feature projection
+# Multi-stream feature projection
 # ---------------------------------------------------------------------------
 
-class MultiStreamVidProjection(nn.Module):
-    """Project heterogeneous video feature streams independently, then fuse.
+class MultiStreamProjection(nn.Module):
+    """Project heterogeneous feature streams independently, then fuse.
 
-    Each stream gets its own LinearLayer (stream_dim → H), then all projected
-    streams are concatenated and fused through a single Linear+LN+GELU layer.
+    Each stream gets its own LinearLayer stack (stream_dim -> H). Multi-stream
+    inputs are fused with adaptive per-position stream weights. The optional
+    "hybrid" mode additionally preserves a learned concat-fusion path and blends
+    it with the weighted sum.
 
     Handles any number of streams dynamically:
-      - 1 stream  → single LinearLayer, no fusion (Identity)
-      - N streams → N LinearLayers + Linear(N*H → H) fusion
+      - 1 stream  -> single LinearLayer stack, no fusion
+      - N streams -> N LinearLayer stacks + adaptive stream fusion
 
     Args:
         stream_dims : list[int]  per-stream feature dimensions, must match
@@ -374,6 +376,10 @@ class MultiStreamVidProjection(nn.Module):
                                  e.g. [512]            for CLIP-only
         H           : int        target hidden size
         dropout     : float      dropout probability for each LinearLayer
+        fusion_mode : str        "weighted_sum" keeps the original behavior;
+                                 "hybrid" blends weighted-sum and concat fusion
+        stream_dropout: float    training-only probability of dropping a stream
+                                 for each sample before fusion
 
     Forward:
         x_visual : (B, L, sum(stream_dims))
@@ -381,12 +387,21 @@ class MultiStreamVidProjection(nn.Module):
         returns (B, L, H)
     """
 
-    def __init__(self, stream_dims: list, H: int, dropout: float = 0.1, n_proj=2, tef_dim=0):
+    def __init__(self, stream_dims: list, H: int, dropout: float = 0.1,
+                 n_proj=2, tef_dim=0, fusion_mode: str = "weighted_sum",
+                 stream_dropout: float = 0.0):
         super().__init__()
         if len(stream_dims) < 1:
             raise ValueError("stream_dims must have at least one element")
+        if fusion_mode not in {"weighted_sum", "hybrid"}:
+            raise ValueError(f"fusion_mode must be 'weighted_sum' or 'hybrid', got '{fusion_mode}'")
         self.stream_dims = stream_dims
+        self.expected_dim = sum(stream_dims)
         self.tef_dim = tef_dim
+        self.fusion_mode = fusion_mode
+        self.stream_dropout = float(stream_dropout)
+        if not 0.0 <= self.stream_dropout <= 1.0:
+            raise ValueError(f"stream_dropout must be in [0, 1], got {self.stream_dropout}")
 
         relu_args = [True] * n_proj
         if n_proj >= 3:
@@ -404,26 +419,58 @@ class MultiStreamVidProjection(nn.Module):
 
         n = len(stream_dims)
         self.last_stream_weights = None
+        self.last_hybrid_blend_mean = None
         if n > 1:
             self.stream_logits = nn.Parameter(torch.zeros(n))
-            self.fusion = nn.Sequential(
-                nn.Linear(n * H, H, bias=False),
-                nn.LayerNorm(H),
-                nn.GELU(),
-            )
             self.stream_gate = nn.Sequential(
                 nn.LayerNorm(H),
-                nn.Linear(H, H // 2),
+                nn.Linear(H, max(H // 2, 1)),
                 nn.GELU(),
-                nn.Linear(H // 2, 1),
+                nn.Linear(max(H // 2, 1), 1),
             )
-            self.fusion_norm = nn.LayerNorm(H)
             nn.init.zeros_(self.stream_gate[-1].weight)
             nn.init.zeros_(self.stream_gate[-1].bias)
+
+            if fusion_mode == "hybrid":
+                self.fusion = nn.Sequential(
+                    nn.Linear(n * H, H, bias=False),
+                    nn.LayerNorm(H),
+                    nn.GELU(),
+                )
+                self.hybrid_gate = nn.Sequential(
+                    nn.LayerNorm(2 * H),
+                    nn.Linear(2 * H, max(H // 2, 1)),
+                    nn.GELU(),
+                    nn.Linear(max(H // 2, 1), 1),
+                )
+                self.fusion_norm = nn.LayerNorm(H)
+                nn.init.zeros_(self.hybrid_gate[-1].weight)
+                nn.init.constant_(self.hybrid_gate[-1].bias, -2.0)
         else:
             self.fusion = nn.Identity()
 
+    def _stream_keep_mask(self, stacked):
+        """Sample a per-example stream keep mask for training-time stream dropout."""
+        if (not self.training or self.stream_dropout <= 0.0
+                or stacked.shape[2] <= 1):
+            return None
+
+        B, _, n, _ = stacked.shape
+        keep = torch.rand(B, 1, n, device=stacked.device) >= self.stream_dropout
+        all_dropped = ~keep.any(dim=2, keepdim=True)
+        if all_dropped.any():
+            fallback = torch.randint(n, (B, 1, 1), device=stacked.device)
+            fallback_keep = torch.zeros_like(keep).scatter(2, fallback, True)
+            keep = torch.where(all_dropped.expand_as(keep), fallback_keep, keep)
+        return keep
+
     def forward(self, x_visual: torch.Tensor, tef: torch.Tensor = None) -> torch.Tensor:
+        self.last_hybrid_blend_mean = None
+        if x_visual.shape[-1] != self.expected_dim:
+            raise ValueError(
+                f"multi-stream feature dim mismatch: got {x_visual.shape[-1]}, "
+                f"expected {self.expected_dim} from stream_dims={self.stream_dims}"
+            )
         if self.tef_dim > 0:
             if tef is None:
                 raise ValueError("tef must be provided when tef_dim > 0")
@@ -442,13 +489,29 @@ class MultiStreamVidProjection(nn.Module):
 
         if len(projected) > 1:
             stacked = torch.stack(projected, dim=2)
+            keep_mask = self._stream_keep_mask(stacked)
             gate_logits = self.stream_gate(stacked).squeeze(-1) + self.stream_logits.view(1, 1, -1)
+            if keep_mask is not None:
+                gate_logits = gate_logits.masked_fill(~keep_mask, -1e4)
+                stacked = stacked * keep_mask.unsqueeze(-1).to(stacked.dtype)
             alpha = F.softmax(gate_logits, dim=-1)
             adaptive_fused = (alpha.unsqueeze(-1) * stacked).sum(dim=2)
             self.last_stream_weights = alpha.detach().mean(dim=(0, 1))
 
+            if self.fusion_mode == "hybrid":
+                B, L, n, H = stacked.shape
+                concat_fused = self.fusion(stacked.reshape(B, L, n * H))
+                blend = torch.sigmoid(self.hybrid_gate(
+                    torch.cat([adaptive_fused, concat_fused], dim=-1)))
+                self.last_hybrid_blend_mean = blend.detach().mean()
+                return self.fusion_norm(
+                    (1.0 - blend) * adaptive_fused + blend * concat_fused)
+
             return adaptive_fused
         return projected[0]                                   # (B, L, H)
+
+
+MultiStreamVidProjection = MultiStreamProjection
 
 
 # ---------------------------------------------------------------------------
@@ -675,6 +738,8 @@ class GaussianFormer_VMR(nn.Module):
         self._visual_vid_dim = sum(_stream_dims) if _stream_dims else config.v_feat_dim
         self._tef_dim = 2 if getattr(config, "use_tef", False) else 0
         self._use_ms_vid = getattr(config, "use_multistream_projection", None)
+        self._video_multistream_fusion = getattr(config, "video_multistream_fusion", "hybrid")
+        self._video_stream_dropout = getattr(config, "video_stream_dropout", 0.0)
         if self._use_ms_vid is None:
             self._use_ms_vid = bool(_stream_dims and len(_stream_dims) > 1)
 
@@ -683,9 +748,10 @@ class GaussianFormer_VMR(nn.Module):
         if self._use_ms_vid:
             if not _stream_dims:
                 raise ValueError("use_multistream_projection=True requires config.v_feat_dims")
-            self.input_vid_proj = MultiStreamVidProjection(
+            self.input_vid_proj = MultiStreamProjection(
                 _stream_dims, H, dropout=config.input_drop, n_proj=_n_proj,
-                tef_dim=self._tef_dim)
+                tef_dim=self._tef_dim, fusion_mode=self._video_multistream_fusion,
+                stream_dropout=self._video_stream_dropout)
         else:
             # Legacy concatenated projection: n_input_proj stacked layers
             _relu_args = [True] * _n_proj
@@ -710,8 +776,9 @@ class GaussianFormer_VMR(nn.Module):
         if _use_ms_txt:
             if not _txt_stream_dims:
                 raise ValueError("use_multistream_text_projection=True requires config.t_feat_dims")
-            self.input_txt_proj = MultiStreamVidProjection(
-                _txt_stream_dims, H, dropout=config.input_drop)
+            self.input_txt_proj = MultiStreamProjection(
+                _txt_stream_dims, H, dropout=config.input_drop,
+                fusion_mode="weighted_sum")
         else:
             _n_proj_t    = getattr(config, "n_input_proj", 2)
             _relu_args_t = [True] * _n_proj_t

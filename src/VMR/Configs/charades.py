@@ -14,7 +14,7 @@ cfg = dict(_qvh.cfg)
 
 cfg["seed"]         = 36
 
-cfg["model_name"]   = "GaussianFormer_VMR_v23"
+cfg["model_name"]   = "GaussianFormer_VMR_v26"
 cfg["dataset_name"] = "charades_sta"
 cfg["dset_name"]    = "charades_sta"
 
@@ -22,11 +22,9 @@ cfg["data_root"]   = ""
 cfg["v_feat_dirs"] = [
     "/content/charades/slowfast_features",
     "/content/charades/clip_features",
-    "/content/charades/blip_video_features",
 ]
 cfg["q_feat_dir"] = [
     "/content/charades/clip_text_features",
-    "/content/charades/blip_text_features",
 ]
 
 cfg["train_path"] = "/content/drive/MyDrive/Master/Thesis/QD-DETR/data/charades-sta/train.jsonl"
@@ -37,10 +35,10 @@ cfg["model_root"] = os.path.join(cfg["root"], cfg["dataset_name"], cfg["model_na
 
 # Per-stream dimensions drive the multi-stream projection layers.
 # The summed totals are kept for logging and legacy code paths.
-cfg["v_feat_dims"]                     = [2304, 512, 768]  # SlowFast | CLIP | BLIP; order must match v_feat_dirs.
+cfg["v_feat_dims"]                     = [2304, 512]  # SlowFast | CLIP | BLIP; order must match v_feat_dirs.
 cfg["v_feat_dim"]                      = sum(cfg["v_feat_dims"])
 cfg["use_multistream_projection"]      = True
-cfg["t_feat_dims"]                     = [512, 768]  # CLIP | BLIP; order must match q_feat_dir.
+cfg["t_feat_dims"]                     = [512]  # CLIP | BLIP; order must match q_feat_dir.
 cfg["t_feat_dim"]                      = sum(cfg["t_feat_dims"])
 cfg["use_multistream_text_projection"] = True
 cfg["n_input_proj"]                    = 2
@@ -49,10 +47,12 @@ cfg["max_v_l"]                         = 75
 cfg["clip_len"]                        = 1.0
 cfg["use_tef"]                         = True
 cfg["v_feat_len_mode"]                 = "time_grid"  # Options: time_grid | max | min. time_grid uses duration/clip_len canonical alignment.
+cfg["video_multistream_fusion"]        = "hybrid"     # Keep adaptive weights, but preserve concat-fused complementary video features.
+cfg["video_stream_dropout"]            = 0.05         # Light training-only stream dropout for robustness; text fusion is unchanged.
 
 # ---- Model architecture --------------------------------------------------
 cfg["hidden_size"]               = 384
-cfg["n_heads"]                   = 6
+cfg["n_heads"]                   = 8
 cfg["num_queries"]               = 6            # Stage-3 ablation: try 6 for lower ranking noise on single-moment data.
 cfg["dec_layers"]                = 3
 cfg["input_drop"]                = 0.25
@@ -72,7 +72,7 @@ cfg["use_txt_in_memory"]         = True
 cfg["use_mem_kv_for_txt_memory"] = True
 cfg["use_global_in_encoder"]     = True
 cfg["use_boundary_refinement"]   = True
-cfg["refine_gate_max"]           = 0.85
+cfg["refine_gate_max"]           = 0.9
 
 # Matcher supervision, label supervision, and inference span selection are related but separate:
 # - match_span_source selects the spans used in matching cost.
@@ -130,12 +130,12 @@ cfg["lr"]                   = 1.5e-4
 cfg["lr_vid_enc"]           = 0.75e-4
 cfg["lr_refiner"]           = 1.5e-4      # Give the refinement head enough learning signal.
 cfg["lr_txt_enc"]           = 0.75e-4
-cfg["lr_drop"]              = 25        # Step decay after warmup at epoch 30; aligns with the observed validation peak.
+cfg["lr_drop"]              = 30        # Step decay after warmup at epoch 30; aligns with the observed validation peak.
 cfg["lr_gamma"]             = 0.5       # Legacy field kept for compatibility.
 cfg["warmup_epochs"]        = 5
-cfg["cosine_T0"]            = 0
-cfg["cosine_Tmult"]         = 2
-cfg["cosine_eta_min_ratio"] = 0.001
+cfg["cosine_T0"]            = 60
+cfg["cosine_Tmult"]         = 1
+cfg["cosine_eta_min_ratio"] = 0.05
 cfg["wd"]                   = 5e-5
 cfg["grad_clip"]            = 0.3
 
@@ -166,7 +166,7 @@ cfg["iou_thresholds"] = [0.3, 0.5, 0.7]
 
 # ---- Validation schedule -------------------------------------------------
 cfg["val_freq"]                 = 5
-cfg["val_full_epoch"]           = 20         # Run full validation from this epoch onward.
+cfg["val_full_epoch"]           = 25         # Run full validation from this epoch onward.
 cfg["eval_span_source_metrics"] = True       # Report coarse/refined/final validation metrics without changing primary.
 cfg["eval_refine_diagnostics"]  = False      # Report gate percentiles and boundary-delta diagnostics.
 

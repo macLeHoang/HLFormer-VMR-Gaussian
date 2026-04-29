@@ -186,7 +186,7 @@ def build_scheduler(optimizer, cfg):
 
     if cosine_T0 > 0:
         # Cosine annealing with warm restarts + linear warmup
-        cosine_Tmult = cfg.get("cosine_Tmult", 2)
+        cosine_Tmult  = cfg.get("cosine_Tmult", 2)
         eta_min_ratio = cfg.get("cosine_eta_min_ratio", 0.01)  # min LR = 1% of base
 
         def lr_lambda(epoch):
